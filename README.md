@@ -198,3 +198,9 @@ Please keep these areas stable unless intentionally working on a specific fix:
 - Remove Current Build behavior.
 - Smart Overlay Hold / Release Hold + Reapply behavior.
 - Backup/restore safety.
+
+## License
+
+HD Overlay Builder source code is released under the MIT License.
+
+Noto Sans is licensed separately under the SIL Open Font License. See `THIRD_PARTY_NOTICES.md` and `Resources/Fonts/OFL_NOTO_SANS.txt`.
