@@ -130,4 +130,10 @@ public sealed class OverlayEntry
     public uint[]? DdsMValues { get; set; }
     public uint DdsLast4 { get; set; }
     public string EntryPath { get; set; } = "";
+
+    // Source-independent PATHC replay support.  Release Hold + Reapply and
+    // Relink should not require the original extracted DDS source folder after
+    // the managed HD## overlays have already been built.
+    public string OverlayDir { get; set; } = "";
+    public byte[]? DdsPathcHeader { get; set; }
 }

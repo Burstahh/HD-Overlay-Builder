@@ -4,6 +4,8 @@ using System.Text.Json.Serialization;
 using System.Security.Cryptography;
 using System.Diagnostics;
 using System.Collections.Concurrent;
+using System.Globalization;
+using System.Text.RegularExpressions;
 
 namespace CDTextureOverlayBuilder.Core;
 
@@ -87,7 +89,7 @@ public sealed class OverlayService
     // preset list.  The actual scan still uses folders that exist on disk.
 
     public const string AppName = "HD Overlay Builder";
-    public const string AppVersion = "1.4";
+    public const string AppVersion = "1.4.2";
     private const string ManagedOverlayPrefix = "HD";
     private const string ManagedOverlayMarkerFile = "HD_UPSCALE_OVERLAY_BUILDER_MANAGED.txt";
     private const string LegacyManagedOverlayMarkerFile = "HD_OVERLAY_BUILDER_MANAGED.txt";
@@ -234,12 +236,13 @@ public sealed class OverlayService
     {
         string v = (memoryMode ?? "Auto").Trim();
         if (v.Equals("Full", StringComparison.OrdinalIgnoreCase) || v.Contains("Max", StringComparison.OrdinalIgnoreCase)) return "Max Performance";
-        if (v.Equals("Medium", StringComparison.OrdinalIgnoreCase) || v.Contains("Medium", StringComparison.OrdinalIgnoreCase)) return "Medium";
+        if (v.Equals("Medium", StringComparison.OrdinalIgnoreCase) || v.Contains("Medium", StringComparison.OrdinalIgnoreCase) || v.Contains("Balanced", StringComparison.OrdinalIgnoreCase)) return "Balanced";
+        if (v.Equals("Safe", StringComparison.OrdinalIgnoreCase) || v.Contains("Safe", StringComparison.OrdinalIgnoreCase) || v.Contains("External", StringComparison.OrdinalIgnoreCase) || v.Contains("Slow", StringComparison.OrdinalIgnoreCase)) return "Slow / External Drive Safe Mode";
         if (v.Equals("Low", StringComparison.OrdinalIgnoreCase) || v.Contains("Low", StringComparison.OrdinalIgnoreCase)) return "Low";
         return "Auto / Recommended";
     }
 
-    private sealed record StorageProbeResult(string Purpose, string Path, string Root, double WriteMbPerSec, double ReadMbPerSec, string Tier, string Detail);
+    private sealed record StorageProbeResult(string Purpose, string Path, string Root, string DriveType, long ProbeBytes, double WriteMbPerSec, double ReadMbPerSec, double MaxWriteChunkMs, string Tier, string Detail);
     private sealed record StoragePerformancePolicy(string EffectiveMode, int EffectiveCustomWorkers, string Tier, bool WarnUser, string RuntimeSummary);
 
     private static readonly ConcurrentDictionary<string, StorageProbeResult> StorageProbeCache = new(StringComparer.OrdinalIgnoreCase);
@@ -249,9 +252,54 @@ public sealed class OverlayService
         string v = (memoryMode ?? "Auto").Trim().ToLowerInvariant();
         if (v.Contains("full") || v.Contains("max")) return false;
         if (v.Contains("medium") || v.Contains("balanced")) return false;
-        if (v.Contains("low") || v.Contains("safe")) return false;
+        if (v.Contains("low") || v.Contains("safe") || v.Contains("external") || v.Contains("slow")) return false;
         if (v.Contains("custom")) return false;
         return true;
+    }
+
+    public static bool ShouldUseExternalDriveSafeModeForSelectedFolders(string gameDir, string textureDir, out string summary)
+    {
+        summary = string.Empty;
+        try
+        {
+            if (string.IsNullOrWhiteSpace(gameDir) || string.IsNullOrWhiteSpace(textureDir)) return false;
+            if (!Directory.Exists(gameDir) || !Directory.Exists(textureDir)) return false;
+
+            // UI/preflight detection intentionally mirrors the build-time Auto policy,
+            // but it runs before applying so users on USB/external/slow storage see
+            // the dropdown switch to the safer mode before the build starts.
+            string outputProbeRoot = RegistryRoot(gameDir);
+            var outputProbe = ProbeStoragePath("preflight-game/output", outputProbeRoot, allowWriteProbe: true, _ => { });
+            var sourceProbe = ProbeStoragePath("preflight-dds-source", textureDir, allowWriteProbe: false, _ => { });
+            bool sameRoot = SameStorageRoot(gameDir, textureDir);
+            string worstTier = WorstStorageTier(outputProbe.Tier, sourceProbe.Tier, sameRoot);
+            bool externalLike = IsExternalLikeStorage(outputProbe) || IsExternalLikeStorage(sourceProbe);
+
+            // Be conservative for normal fixed/internal drives. A fixed NVMe can have
+            // a transient slow probe right after a huge build while Windows, AV, or
+            // the filesystem is still flushing. Auto should only switch to Safe Mode
+            // on high-confidence signals: removable/network storage, clearly slow
+            // output writes, or a very-slow source read.
+            bool outputClearlySlow = outputProbe.Tier.Equals("slow", StringComparison.OrdinalIgnoreCase)
+                || outputProbe.Tier.Equals("very-slow", StringComparison.OrdinalIgnoreCase);
+            bool sourceClearlySlow = sourceProbe.Tier.Equals("very-slow", StringComparison.OrdinalIgnoreCase);
+
+            bool safeRecommended = externalLike || outputClearlySlow || sourceClearlySlow;
+
+            if (!safeRecommended)
+            {
+                summary = $"Storage preflight: output {DescribeStorageProbe(outputProbe)}; source {DescribeStorageProbe(sourceProbe)}; same root: {sameRoot}; selected tier: {worstTier}; Auto can stay on normal policy.";
+                return false;
+            }
+
+            summary = $"Storage preflight: output {DescribeStorageProbe(outputProbe)}; source {DescribeStorageProbe(sourceProbe)}; same root: {sameRoot}; selected tier: {worstTier}; Slow / External Drive Safe Mode recommended.";
+            return true;
+        }
+        catch (Exception ex)
+        {
+            summary = "Storage preflight failed: " + ex.Message;
+            return false;
+        }
     }
 
     private static StoragePerformancePolicy ResolveStoragePerformancePolicy(BuildOptions options, Action<string> log)
@@ -268,29 +316,39 @@ public sealed class OverlayService
         int workers = 0;
         bool warn = false;
         string effectiveMode = options.PerformanceMemoryMode;
-        if (worstTier == "very-slow")
+        bool externalLike = IsExternalLikeStorage(outputProbe) || IsExternalLikeStorage(sourceProbe);
+
+        bool outputVerySlow = outputProbe.Tier.Equals("very-slow", StringComparison.OrdinalIgnoreCase);
+        bool outputSlow = outputProbe.Tier.Equals("slow", StringComparison.OrdinalIgnoreCase);
+        bool sourceVerySlow = sourceProbe.Tier.Equals("very-slow", StringComparison.OrdinalIgnoreCase);
+
+        if (externalLike)
         {
-            effectiveMode = "Custom";
+            effectiveMode = "Safe";
+            workers = worstTier == "very-slow" ? 1 : (worstTier == "slow" || sameRoot ? 2 : 3);
+            warn = true;
+        }
+        else if (outputVerySlow || sourceVerySlow)
+        {
+            effectiveMode = "Safe";
             workers = 1;
             warn = true;
         }
-        else if (worstTier == "slow")
+        else if (outputSlow)
         {
-            effectiveMode = "Custom";
+            effectiveMode = "Safe";
             workers = sameRoot ? 1 : 2;
             warn = true;
         }
-        else if (worstTier == "moderate")
-        {
-            effectiveMode = "Custom";
-            workers = sameRoot ? 3 : 4;
-        }
 
         string runtime = $"Storage probe: output {DescribeStorageProbe(outputProbe)}; source {DescribeStorageProbe(sourceProbe)}; same root: {sameRoot}; selected tier: {worstTier}; Auto policy: "
-            + (workers > 0 ? $"{effectiveMode} ({workers} worker(s), single-buffer I/O)" : "normal Auto / Recommended CPU/RAM policy");
+            + (workers > 0 ? $"External Drive Safe Mode ({workers} worker(s), single-buffer I/O)" : "normal Auto / Recommended CPU/RAM policy");
         log("[runtime] " + runtime);
-        if (warn)
-            log("Slow storage detected. Auto Performance reduced worker/I/O concurrency to avoid drive stalls. Apply time may be longer.");
+        if (workers > 0)
+        {
+            log("Slow or external storage detected. This build may be much slower because HD Overlay Builder performs heavy PAZ read/write and CRC work. External Drive Safe Mode will reduce simultaneous disk pressure.");
+            log($"External Drive Safe Mode active: PAZ pipeline will use single-buffer I/O and cap payload prep to {workers} worker(s). Select Max Performance or Balanced manually only if you want to override Auto.");
+        }
 
         return new StoragePerformancePolicy(effectiveMode, workers > 0 ? workers : options.CustomPrepareWorkers, worstTier, warn, runtime);
     }
@@ -313,44 +371,98 @@ public sealed class OverlayService
         return result;
     }
 
+    private static string GetDriveTypeLabel(string root)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(root)) return "unknown";
+            return new DriveInfo(root).DriveType.ToString();
+        }
+        catch { return "unknown"; }
+    }
+
+    private static bool IsExternalLikeStorage(StorageProbeResult p)
+        => p.DriveType.Equals("Removable", StringComparison.OrdinalIgnoreCase)
+           || p.DriveType.Equals("Network", StringComparison.OrdinalIgnoreCase);
+
+    private static string ApplyDriveTypeToTier(string tier, string driveType)
+    {
+        if (driveType.Equals("Removable", StringComparison.OrdinalIgnoreCase) || driveType.Equals("Network", StringComparison.OrdinalIgnoreCase))
+        {
+            if (tier == "unknown" || tier == "fast") return "slow";
+        }
+        return tier;
+    }
+
     private static StorageProbeResult RunWriteReadProbe(string purpose, string path, string root)
     {
-        const int probeBytes = 8 * 1024 * 1024;
+        // The old preflight used a tiny 8 MiB probe, which was too easy for
+        // Windows/device cache to hide on USB 3.x external HDDs.  Use a larger
+        // flushed sequential probe so Auto can catch the drives that look like a
+        // normal fixed disk but collapse during large PAZ writes.
+        const long preferredProbeBytes = 512L * 1024L * 1024L;
+        const long minimumProbeBytes = 128L * 1024L * 1024L;
+        const int chunkBytes = 4 * 1024 * 1024;
         string probeDir = path;
         try { Directory.CreateDirectory(probeDir); }
         catch { probeDir = AppContext.BaseDirectory; }
 
+        long probeBytes = preferredProbeBytes;
+        try
+        {
+            string probeRoot = Path.GetPathRoot(Path.GetFullPath(probeDir)) ?? root;
+            if (!string.IsNullOrWhiteSpace(probeRoot))
+            {
+                var di = new DriveInfo(probeRoot);
+                long free = di.AvailableFreeSpace;
+                if (free < preferredProbeBytes + (256L * 1024L * 1024L))
+                    probeBytes = Math.Max(minimumProbeBytes, Math.Min(preferredProbeBytes, Math.Max(32L * 1024L * 1024L, free / 4)));
+            }
+        }
+        catch { }
+
         string probePath = Path.Combine(probeDir, ".hdupscale_storage_probe.tmp");
-        byte[] buffer = new byte[probeBytes];
+        byte[] buffer = new byte[chunkBytes];
         RandomNumberGenerator.Fill(buffer);
         double write = 0;
         double read = 0;
-        string detail = "write/read probe";
+        double maxWriteChunkMs = 0;
+        string detail = $"flushed sequential write/read probe ({FormatBytesShort(probeBytes)})";
         try
         {
-            var sw = Stopwatch.StartNew();
-            using (var fs = new FileStream(probePath, FileMode.Create, FileAccess.Write, FileShare.None, 1024 * 1024, FileOptions.WriteThrough | FileOptions.SequentialScan))
+            long written = 0;
+            var swTotal = Stopwatch.StartNew();
+            using (var fs = new FileStream(probePath, FileMode.Create, FileAccess.Write, FileShare.None, chunkBytes, FileOptions.WriteThrough | FileOptions.SequentialScan))
             {
-                fs.Write(buffer, 0, buffer.Length);
+                while (written < probeBytes)
+                {
+                    int want = (int)Math.Min(buffer.Length, probeBytes - written);
+                    var swChunk = Stopwatch.StartNew();
+                    fs.Write(buffer, 0, want);
+                    swChunk.Stop();
+                    if (swChunk.Elapsed.TotalMilliseconds > maxWriteChunkMs) maxWriteChunkMs = swChunk.Elapsed.TotalMilliseconds;
+                    written += want;
+                }
                 fs.Flush(true);
             }
-            sw.Stop();
-            write = SecondsToMbPerSec(probeBytes, sw.Elapsed.TotalSeconds);
+            swTotal.Stop();
+            write = SecondsToMbPerSec(written, swTotal.Elapsed.TotalSeconds);
 
             Array.Clear(buffer);
-            sw.Restart();
-            using (var fs = new FileStream(probePath, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024, FileOptions.SequentialScan))
+            long total = 0;
+            swTotal.Restart();
+            using (var fs = new FileStream(probePath, FileMode.Open, FileAccess.Read, FileShare.Read, chunkBytes, FileOptions.SequentialScan))
             {
-                int total = 0;
-                while (total < buffer.Length)
+                while (total < probeBytes)
                 {
-                    int n = fs.Read(buffer, total, buffer.Length - total);
+                    int want = (int)Math.Min(buffer.Length, probeBytes - total);
+                    int n = fs.Read(buffer, 0, want);
                     if (n <= 0) break;
                     total += n;
                 }
             }
-            sw.Stop();
-            read = SecondsToMbPerSec(probeBytes, sw.Elapsed.TotalSeconds);
+            swTotal.Stop();
+            read = total > 0 ? SecondsToMbPerSec(total, swTotal.Elapsed.TotalSeconds) : 0;
         }
         catch (Exception ex)
         {
@@ -361,15 +473,17 @@ public sealed class OverlayService
             try { if (File.Exists(probePath)) File.Delete(probePath); } catch { }
         }
 
-        return new StorageProbeResult(purpose, path, root, write, read, ClassifyStorageTier(write, read), detail);
+        string driveType = GetDriveTypeLabel(root);
+        string tier = ApplyDriveTypeToTier(ClassifyStorageTier(write, read, maxWriteChunkMs, probeBytes), driveType);
+        return new StorageProbeResult(purpose, path, root, driveType, probeBytes, write, read, maxWriteChunkMs, tier, detail);
     }
 
     private static StorageProbeResult RunReadSampleProbe(string purpose, string path, string root)
     {
-        const long maxBytes = 8L * 1024L * 1024L;
+        const long maxBytes = 256L * 1024L * 1024L;
         long totalBytes = 0;
         double read = 0;
-        string detail = "source read sample";
+        string detail = $"source read sample ({FormatBytesShort(maxBytes)} max)";
         try
         {
             var files = Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories)
@@ -402,28 +516,52 @@ public sealed class OverlayService
         {
             detail = "read sample failed: " + ex.Message;
         }
-        return new StorageProbeResult(purpose, path, root, 0, read, ClassifyStorageTier(0, read), detail);
+        string driveType = GetDriveTypeLabel(root);
+        string tier = ApplyDriveTypeToTier(ClassifyStorageTier(0, read, 0, totalBytes), driveType);
+        return new StorageProbeResult(purpose, path, root, driveType, totalBytes, 0, read, 0, tier, detail);
     }
 
     private static double SecondsToMbPerSec(long bytes, double seconds)
         => seconds <= 0 ? 0 : (bytes / 1024.0 / 1024.0) / seconds;
 
-    private static string ClassifyStorageTier(double writeMb, double readMb)
+    private static string FormatBytesShort(long bytes)
     {
-        double basis = writeMb > 0 && readMb > 0 ? Math.Min(writeMb, readMb) : Math.Max(writeMb, readMb);
-        if (basis <= 0) return "unknown";
-        if (basis < 40) return "very-slow";
-        if (basis < 100) return "slow";
-        if (basis < 300) return "moderate";
-        return "fast";
+        if (bytes >= 1024L * 1024L * 1024L) return (bytes / 1024.0 / 1024.0 / 1024.0).ToString("F1", CultureInfo.InvariantCulture) + " GiB";
+        if (bytes >= 1024L * 1024L) return (bytes / 1024.0 / 1024.0).ToString("F0", CultureInfo.InvariantCulture) + " MiB";
+        if (bytes >= 1024L) return (bytes / 1024.0).ToString("F0", CultureInfo.InvariantCulture) + " KiB";
+        return bytes.ToString(CultureInfo.InvariantCulture) + " B";
+    }
+
+    private static string ClassifyStorageTier(double writeMb, double readMb, double maxWriteChunkMs = 0, long probeBytes = 0)
+    {
+        // Use sustained write as the strongest signal because the slow user case
+        // was PAZ output taking nearly the entire build.  USB/external HDDs can
+        // report as fixed disks and can look fine for tiny cached writes, so the
+        // larger flushed probe and max-chunk stall check intentionally err on the
+        // safe side.
+        if (writeMb > 0)
+        {
+            if (writeMb < 50 || maxWriteChunkMs > 1500) return "very-slow";
+            if (writeMb < 120 || maxWriteChunkMs > 750) return "slow";
+            if (writeMb < 350 || maxWriteChunkMs > 300) return "moderate";
+            return "fast";
+        }
+
+        if (readMb > 0)
+        {
+            if (readMb < 40) return "very-slow";
+            if (readMb < 100) return "slow";
+            if (readMb < 300) return "moderate";
+            return "fast";
+        }
+
+        return "unknown";
     }
 
     private static string WorstStorageTier(string outputTier, string sourceTier, bool sameRoot)
     {
         int rank(string t) => t switch { "very-slow" => 4, "slow" => 3, "moderate" => 2, "fast" => 1, _ => 0 };
         string worst = rank(outputTier) >= rank(sourceTier) ? outputTier : sourceTier;
-        if (sameRoot && worst == "moderate") return "slow";
-        if (sameRoot && worst == "slow") return "very-slow";
         return worst == "unknown" ? outputTier : worst;
     }
 
@@ -439,7 +577,7 @@ public sealed class OverlayService
     }
 
     private static string DescribeStorageProbe(StorageProbeResult p)
-        => $"{p.Purpose} storage: tier {p.Tier}, write {(p.WriteMbPerSec > 0 ? p.WriteMbPerSec.ToString("F1") : "n/a")} MB/s, read {(p.ReadMbPerSec > 0 ? p.ReadMbPerSec.ToString("F1") : "n/a")} MB/s, root '{p.Root}', path '{p.Path}' ({p.Detail})";
+        => $"{p.Purpose} storage: tier {p.Tier}, drive {p.DriveType}, probe {FormatBytesShort(p.ProbeBytes)}, write {(p.WriteMbPerSec > 0 ? p.WriteMbPerSec.ToString("F1") : "n/a")} MB/s, read {(p.ReadMbPerSec > 0 ? p.ReadMbPerSec.ToString("F1") : "n/a")} MB/s, max write chunk {(p.MaxWriteChunkMs > 0 ? p.MaxWriteChunkMs.ToString("F0") : "n/a")} ms, root '{p.Root}', path '{p.Path}' ({p.Detail})";
 
     private sealed class BuildTimingBreakdown
     {
@@ -690,6 +828,7 @@ public sealed class OverlayService
         var overlayTimings = new OverlayBuilder.OverlayBuildTimings();
         var createdNewOverlayDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var hotfixOverlayBackups = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        string pathcReplaySnapshot = string.Empty;
 
         try
         {
@@ -698,6 +837,14 @@ public sealed class OverlayService
         {
             log("== Updating existing managed overlays ==");
             var hotfix = RebuildExistingManagedOverlays(options.GameDir, matchesForExistingOverlayUpdates, existingUpdateTargets, modifiedPamts, hotfixOverlayBackups, log, progress, File.Exists(vanillaPathc) ? vanillaPathc : null, effectivePerformanceMemoryMode, effectiveCustomPrepareWorkers, overlayTimings, cancellationToken);
+            foreach (var entry in hotfix.entries)
+            {
+                if (string.IsNullOrWhiteSpace(entry.OverlayDir) && !string.IsNullOrWhiteSpace(entry.EntryPath))
+                {
+                    var owner = existingUpdateTargets.TryGetValue(OverlayBuilder.Norm(string.IsNullOrEmpty(entry.DirPath) ? entry.EntryPath : $"{entry.DirPath.Trim('/')}/{entry.Filename}"), out var target) ? target.OverlayDir : "";
+                    if (!string.IsNullOrWhiteSpace(owner)) entry.OverlayDir = owner;
+                }
+            }
             allOverlayEntriesForPathc.AddRange(hotfix.entries);
             matchesForPathc.AddRange(matchesForExistingOverlayUpdates);
             foreach (var ci in hotfix.chunkInfos) chunkInfos.Add(ci);
@@ -762,6 +909,7 @@ public sealed class OverlayService
                         log($"  overlay {ci + 1}/{chunks.Count}: {logPhase} {Math.Min(i, total)}/{total} {clean}");
                     }
                 }, File.Exists(vanillaPathc) ? vanillaPathc : null, cancellationToken, effectivePerformanceMemoryMode, effectiveCustomPrepareWorkers, overlayTimings);
+                SetOverlayDir(entries, od);
                 cancellationToken.ThrowIfCancellationRequested();
                 File.WriteAllBytes(Path.Combine(outDir, "0.pamt"), pamtBytes);
                 modifiedPamts[od] = pamtBytes;
@@ -788,7 +936,11 @@ public sealed class OverlayService
             var pathcWatch = Stopwatch.StartNew();
             var pathcUpdate = UpdatePathcForMatches(options.GameDir, matchesForPathc, allOverlayEntriesForPathc, log, progress, 88, 95, "PATHC");
             cancellationToken.ThrowIfCancellationRequested();
-            if (pathcUpdate.bytes != null) SafeWrite(Path.Combine(options.GameDir, "meta", "0.pathc"), pathcUpdate.bytes);
+            if (pathcUpdate.bytes != null)
+            {
+                SafeWrite(Path.Combine(options.GameDir, "meta", "0.pathc"), pathcUpdate.bytes);
+                pathcReplaySnapshot = CopyPathcReplaySnapshot(options.GameDir, "apply", log);
+            }
             DebugFailureInjector.Check(DebugFailureInjector.AfterPathcBeforePapgt, log);
             pathcWatch.Stop();
             timing.PathcUpdateSeconds += pathcWatch.Elapsed.TotalSeconds;
@@ -823,6 +975,7 @@ public sealed class OverlayService
             ["updated_existing_count"] = matchesForExistingOverlayUpdates.Count,
             ["new_overlay_texture_count"] = matchesForNewOverlays.Count,
             ["report"] = reportPath, ["chunks"] = chunkInfos,
+            ["pathc_replay_snapshot"] = pathcReplaySnapshot,
             ["matches"] = matches, ["overlay_entries"] = allOverlayEntriesForPathc,
             ["matching_policy"] = BuildMatchingPolicy(options), ["performance_memory_mode"] = options.PerformanceMemoryMode, ["effective_performance_memory_mode"] = effectivePerformanceMemoryMode, ["effective_custom_prepare_workers"] = effectiveCustomPrepareWorkers, ["storage_performance_tier"] = storagePolicy.Tier
         };
@@ -832,7 +985,7 @@ public sealed class OverlayService
         if (options.ApplyToGame && overlayDirs.Count > 0)
         {
             DebugFailureInjector.Check(DebugFailureInjector.BeforeActiveRegistryWrite, log);
-            RegisterAppliedManifest(options.GameDir, manifestPath, manifest, log);
+            RegisterAppliedManifest(options.GameDir, manifestPath, manifest, log, initializeManagedBase: !options.UpdateExistingOverlays);
         }
         else if (options.ApplyToGame && updatedOverlayDirs.Count > 0)
         {
@@ -899,6 +1052,45 @@ public sealed class OverlayService
             return snapshot != null && snapshot.IsValid;
         }
         catch { return false; }
+    }
+
+    public static bool HasAnyManagedBuildState(string gameDir)
+    {
+        try
+        {
+            if (!IsGameDir(gameDir)) return false;
+
+            // Read-only workflow detection: do not auto-repair or migrate state
+            // merely because the user clicked Easy Apply and may still cancel.
+            foreach (var path in new[] { RegistryPath(gameDir), PreviousRegistryPath(gameDir), LegacyRegistryPath(gameDir), LegacyNestedRegistryPath(gameDir) })
+            {
+                var reg = ReadJsonDict(path);
+                if (reg == null) continue;
+                foreach (var mod in ObjMods(reg).Where(IsTextureMod))
+                {
+                    if (StringListObj(mod.GetValueOrDefault("overlay_dirs")).Count > 0) return true;
+                    if (HeldOverlayList(mod).Count > 0) return true;
+                }
+            }
+
+            if (ActiveTargetManifestPaths(gameDir).Any(File.Exists)) return true;
+
+            foreach (var dir in Directory.EnumerateDirectories(gameDir, ManagedOverlayPrefix + "??"))
+            {
+                if (LooksLikeToolOwnedOverlayFolder(dir)) return true;
+            }
+
+            foreach (var holdRoot in RegistryHoldRoots(gameDir).Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                if (!Directory.Exists(holdRoot)) continue;
+                foreach (var dir in Directory.EnumerateDirectories(holdRoot, ManagedOverlayPrefix + "??", SearchOption.AllDirectories))
+                {
+                    if (LooksLikeToolOwnedOverlayFolder(dir)) return true;
+                }
+            }
+        }
+        catch { }
+        return false;
     }
 
     private static HashSet<string> GetManagedOverlayDirs(string gameDir, Action<string>? log = null)
@@ -1050,6 +1242,7 @@ public sealed class OverlayService
                 else if (isOversizedGuard) log($"  existing {od}: {clean}");
                 else if (i >= total || i % 50 == 0) log($"  existing {od}: {(isPrepare ? "prep" : isWrite ? "write" : "step")} {Math.Min(i, total)}/{total} {clean}");
             }, vanillaPathc, cancellationToken, performanceMemoryMode, customPrepareWorkers, overlayTimings);
+            SetOverlayDir(rebuiltEntries, od);
             cancellationToken.ThrowIfCancellationRequested();
             File.WriteAllBytes(Path.Combine(outDir, "0.pamt"), pamtBytes);
             DebugFailureInjector.Check(DebugFailureInjector.HotfixAfterPamtBeforePathc, log);
@@ -1257,6 +1450,7 @@ public sealed class OverlayService
             }, vanillaPathc, cancellationToken, performanceMemoryMode, customPrepareWorkers, overlayTimings);
 
             pazHeaders[(int)partIndex] = (rebuilt.crc, rebuilt.length);
+            SetOverlayDir(rebuilt.entries, overlayDir);
             foreach (var entry in rebuilt.entries)
             {
                 string full = FullPathFromOverlayEntry(entry);
@@ -1272,6 +1466,8 @@ public sealed class OverlayService
         }
 
         var allEntries = oldEntries.Select(e => updatedEntriesByFull.TryGetValue(FullPathFromOverlayEntry(e), out var updated) ? CloneOverlayEntry(updated) : CloneOverlayEntry(e)).ToList();
+        SetOverlayDir(allEntries, overlayDir);
+        SetOverlayDir(changedEntriesForPathc, overlayDir);
         byte[] pamtBytes = OverlayBuilder.BuildPamtFromExistingEntries(allEntries, pazHeaders);
         File.WriteAllBytes(pamtPath, pamtBytes);
         DebugFailureInjector.Check(DebugFailureInjector.HotfixAfterPamtBeforePathc, log);
@@ -1337,8 +1533,18 @@ public sealed class OverlayService
         Flags = e.Flags,
         DdsMValues = e.DdsMValues == null ? null : e.DdsMValues.ToArray(),
         DdsLast4 = e.DdsLast4,
+        DdsPathcHeader = e.DdsPathcHeader == null ? null : e.DdsPathcHeader.ToArray(),
+        OverlayDir = e.OverlayDir,
         EntryPath = e.EntryPath
     };
+
+    private static void SetOverlayDir(IEnumerable<OverlayEntry> entries, string overlayDir)
+    {
+        foreach (var e in entries)
+        {
+            if (string.IsNullOrWhiteSpace(e.OverlayDir)) e.OverlayDir = overlayDir;
+        }
+    }
 
     private static byte[] ReadPackedOverlayPayload(string gameDir, string overlayDir, OverlayEntry e)
     {
@@ -1389,8 +1595,9 @@ public sealed class OverlayService
             var list = new List<OverlayEntry>();
             if (ch.TryGetProperty("entries", out var entries) && entries.ValueKind == JsonValueKind.Array)
             {
-                foreach (var el in entries.EnumerateArray()) list.Add(ReadOverlayEntry(el));
+                foreach (var el in entries.EnumerateArray()) list.Add(ReadOverlayEntry(el, od));
             }
+            SetOverlayDir(list, od);
             result[od] = list;
         }
         return result;
@@ -1400,12 +1607,29 @@ public sealed class OverlayService
     {
         var result = new List<OverlayEntry>();
         using var doc = JsonDocument.Parse(File.ReadAllText(manifestPath));
+
+        // Prefer per-chunk entries when available because they preserve the
+        // owning HD## folder. That lets Release Hold + Reapply and Relink
+        // recover DDS PATHC header data directly from installed/held PAZ files
+        // when old manifests do not yet contain cached source-independent data.
+        if (doc.RootElement.TryGetProperty("chunks", out var chunks) && chunks.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var ch in chunks.EnumerateArray())
+            {
+                string od = JStr(ch, "overlay_dir", "OverlayDir");
+                if (string.IsNullOrWhiteSpace(od)) continue;
+                if (!ch.TryGetProperty("entries", out var entries) || entries.ValueKind != JsonValueKind.Array) continue;
+                foreach (var el in entries.EnumerateArray()) result.Add(ReadOverlayEntry(el, od));
+            }
+            if (result.Count > 0) return result;
+        }
+
         if (!doc.RootElement.TryGetProperty("overlay_entries", out var arr) || arr.ValueKind != JsonValueKind.Array) return result;
         foreach (var el in arr.EnumerateArray()) result.Add(ReadOverlayEntry(el));
         return result;
     }
 
-    private static OverlayEntry ReadOverlayEntry(JsonElement el)
+    private static OverlayEntry ReadOverlayEntry(JsonElement el, string overlayDir = "")
     {
         return new OverlayEntry
         {
@@ -1418,9 +1642,30 @@ public sealed class OverlayService
             DecompSize = (uint)JLong(el, "DecompSize", "decomp_size"),
             Flags = (ushort)JLong(el, "Flags", "flags"),
             DdsLast4 = (uint)JLong(el, "DdsLast4", "dds_last4"),
-            DdsMValues = JUIntArray(el, "DdsMValues", "dds_m_values")
+            DdsMValues = JUIntArray(el, "DdsMValues", "dds_m_values"),
+            DdsPathcHeader = JByteArray(el, "DdsPathcHeader", "dds_pathc_header"),
+            OverlayDir = JStr(el, "OverlayDir", "overlay_dir").DefaultIfEmpty(overlayDir)
         };
     }
+
+    private static string RelinkMatchTargetKey(MatchedFile match)
+    {
+        string target = !string.IsNullOrWhiteSpace(match.FullPath) ? match.FullPath : match.EntryPath;
+        if (string.IsNullOrWhiteSpace(target) && !string.IsNullOrWhiteSpace(match.PamtDir) && !string.IsNullOrWhiteSpace(match.EntryPath))
+            target = $"{match.PamtDir}/{match.EntryPath}";
+        return OverlayBuilder.Norm(target);
+    }
+
+    private static string RelinkOverlayTargetKey(OverlayEntry entry)
+    {
+        string target = !string.IsNullOrWhiteSpace(entry.DirPath) && !string.IsNullOrWhiteSpace(entry.Filename)
+            ? $"{entry.DirPath.Trim('/')}/{entry.Filename}"
+            : entry.EntryPath;
+        return OverlayBuilder.Norm(target);
+    }
+
+    private static string RelinkOverlayOwnerKey(OverlayEntry entry)
+        => OverlayBuilder.Norm(entry.OverlayDir);
 
     private static void UpdateManifestAfterHotfix(string manifestPath, string overlayDir, List<MatchedFile> replacements, List<OverlayEntry> rebuiltEntries, Action<string>? log)
     {
@@ -1428,6 +1673,7 @@ public sealed class OverlayService
         {
             var manifest = ReadJsonDict(manifestPath);
             if (manifest == null) return;
+            SetOverlayDir(rebuiltEntries, overlayDir);
             var repl = replacements.GroupBy(m => OverlayBuilder.Norm(m.FullPath)).ToDictionary(g => g.Key, g => g.Last(), StringComparer.OrdinalIgnoreCase);
             if (manifest.TryGetValue("matches", out var rawMatches) && rawMatches is List<object?> list)
             {
@@ -1487,7 +1733,7 @@ public sealed class OverlayService
                     foreach (var e in entries)
                     {
                         if (e is OverlayEntry oe) list.Add(CloneOverlayEntry(oe));
-                        else if (e is Dictionary<string, object?> d) list.Add(ReadOverlayEntry(d));
+                        else if (e is Dictionary<string, object?> d) list.Add(ReadOverlayEntry(d, od));
                     }
                 }
                 else if (raw is IEnumerable<OverlayEntry> overlayEntries)
@@ -1495,12 +1741,13 @@ public sealed class OverlayService
                     foreach (var e in overlayEntries) list.Add(CloneOverlayEntry(e));
                 }
             }
+            SetOverlayDir(list, od);
             result[od] = list;
         }
         return result;
     }
 
-    private static OverlayEntry ReadOverlayEntry(Dictionary<string, object?> d)
+    private static OverlayEntry ReadOverlayEntry(Dictionary<string, object?> d, string overlayDir = "")
     {
         uint U(string key1, string key2 = "")
         {
@@ -1523,6 +1770,19 @@ public sealed class OverlayService
             }
             else if (raw is uint[] ua) arr = ua.ToArray();
         }
+        byte[]? hdr = null;
+        if (d.TryGetValue("DdsPathcHeader", out raw) || d.TryGetValue("dds_pathc_header", out raw))
+        {
+            if (raw is string b64)
+            {
+                try { hdr = Convert.FromBase64String(b64); } catch { hdr = null; }
+            }
+            else if (raw is List<object?> lo)
+            {
+                try { hdr = lo.Select(x => (byte)(byte.TryParse(Convert.ToString(x), out var b) ? b : 0)).ToArray(); } catch { hdr = null; }
+            }
+            else if (raw is byte[] ba) hdr = ba.ToArray();
+        }
         return new OverlayEntry
         {
             DirPath = SObj(d, "DirPath").DefaultIfEmpty(SObj(d, "dir_path")),
@@ -1534,6 +1794,8 @@ public sealed class OverlayService
             Flags = US("Flags", "flags"),
             DdsLast4 = U("DdsLast4", "dds_last4"),
             DdsMValues = arr,
+            DdsPathcHeader = hdr,
+            OverlayDir = SObj(d, "OverlayDir").DefaultIfEmpty(SObj(d, "overlay_dir")).DefaultIfEmpty(overlayDir),
             EntryPath = SObj(d, "EntryPath").DefaultIfEmpty(SObj(d, "entry_path"))
         };
     }
@@ -1577,6 +1839,28 @@ public sealed class OverlayService
                 var vals = v.EnumerateArray().Select(x => (uint)(x.TryGetUInt32(out var u) ? u : 0u)).ToArray();
                 return vals.Length == 0 ? null : vals;
             }
+        return null;
+    }
+
+    private static byte[]? JByteArray(JsonElement el, params string[] names)
+    {
+        foreach (var n in names)
+        {
+            if (!TryGetPropertyIgnoreCase(el, n, out var v)) continue;
+            if (v.ValueKind == JsonValueKind.String)
+            {
+                try { return Convert.FromBase64String(v.GetString() ?? ""); } catch { return null; }
+            }
+            if (v.ValueKind == JsonValueKind.Array)
+            {
+                try
+                {
+                    var vals = v.EnumerateArray().Select(x => (byte)(x.TryGetUInt32(out var u) && u <= byte.MaxValue ? (byte)u : (byte)0)).ToArray();
+                    return vals.Length == 0 ? null : vals;
+                }
+                catch { return null; }
+            }
+        }
         return null;
     }
 
@@ -1660,6 +1944,69 @@ public sealed class OverlayService
         return header;
     }
 
+    private static bool TryBuildDdsPathcRecordFromHeader(byte[]? header, int recordSize, out byte[] record)
+    {
+        record = Array.Empty<byte>();
+        if (header == null || header.Length < 128 || recordSize <= 0) return false;
+        if (header[0] != (byte)'D' || header[1] != (byte)'D' || header[2] != (byte)'S' || header[3] != (byte)' ') return false;
+        string fourcc = header.Length >= 88 ? Encoding.ASCII.GetString(header, 84, 4) : "";
+        int headSize = fourcc == "DX10" && header.Length >= 148 ? 148 : 128;
+        record = new byte[recordSize];
+        Buffer.BlockCopy(header, 0, record, 0, Math.Min(Math.Min(header.Length, headSize), recordSize));
+        return true;
+    }
+
+    private static bool TryReadDdsPathcRecordFromOverlayPayload(string gameDir, OverlayEntry oe, int recordSize, out byte[] record, out string detail)
+    {
+        record = Array.Empty<byte>();
+        detail = string.Empty;
+        if (oe == null) { detail = "missing overlay entry"; return false; }
+        string overlayDir = oe.OverlayDir;
+        if (string.IsNullOrWhiteSpace(overlayDir)) { detail = "manifest entry has no overlay folder owner"; return false; }
+        try
+        {
+            byte[] payload = ReadPackedOverlayPayload(gameDir, overlayDir, oe);
+            if ((oe.Flags & 0xF0) == 0x30)
+            {
+                string keyName = string.IsNullOrWhiteSpace(oe.Filename) ? (oe.EntryPath.Contains('/') ? oe.EntryPath[(oe.EntryPath.LastIndexOf('/') + 1)..] : oe.EntryPath) : oe.Filename;
+                payload = ArchiveCrypto.EncryptDecrypt(payload, keyName);
+            }
+            if (TryBuildDdsPathcRecordFromHeader(payload, recordSize, out record))
+            {
+                detail = $"overlay payload {overlayDir}/{oe.PazIndex}.paz";
+                return true;
+            }
+            detail = $"overlay payload {overlayDir}/{oe.PazIndex}.paz did not contain a readable DDS header";
+            return false;
+        }
+        catch (Exception ex)
+        {
+            detail = ex.Message;
+            return false;
+        }
+    }
+
+    private static Dictionary<uint, byte[]> BuildReplayDdsRecordLookup(IEnumerable<PathcFile>? pathcReplaySources, int recordSize)
+    {
+        var result = new Dictionary<uint, byte[]>();
+        if (pathcReplaySources == null || recordSize <= 0) return result;
+        foreach (var src in pathcReplaySources)
+        {
+            if (src == null || src.KeyHashes.Count != src.MapEntries.Count) continue;
+            for (int i = 0; i < src.KeyHashes.Count; i++)
+            {
+                var me = src.MapEntries[i];
+                if ((me.Selector & 0xFFFF0000u) != 0xFFFF0000u) continue;
+                int ddsIndex = (int)(me.Selector & 0xFFFFu);
+                if (ddsIndex < 0 || ddsIndex >= src.DdsRecords.Count) continue;
+                byte[] rec = src.DdsRecords[ddsIndex];
+                if (rec == null || rec.Length != recordSize) continue;
+                if (!result.ContainsKey(src.KeyHashes[i])) result[src.KeyHashes[i]] = rec;
+            }
+        }
+        return result;
+    }
+
     private static (byte[]? bytes, PathcUpdateResult summary) UpdatePathcForMatches(
         string gameDir,
         List<MatchedFile> matches,
@@ -1668,7 +2015,8 @@ public sealed class OverlayService
         Action<int, string>? progress = null,
         int progressStart = 0,
         int progressEnd = 100,
-        string progressLabel = "PATHC")
+        string progressLabel = "PATHC",
+        List<PathcFile>? replayPathcSources = null)
     {
         progressStart = Math.Max(0, Math.Min(100, progressStart));
         progressEnd = Math.Max(progressStart, Math.Min(100, progressEnd));
@@ -1723,6 +2071,11 @@ public sealed class OverlayService
         var packedWithoutEditableMetadataSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var skippedSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         int recordSize = (int)pathc.Header.DdsRecordSize;
+        var replayDdsRecordByHash = BuildReplayDdsRecordLookup(replayPathcSources, recordSize);
+        int cachedHeaderRecordsUsed = 0;
+        int replaySnapshotRecordsUsed = 0;
+        int overlayPayloadHeaderRecordsUsed = 0;
+        int sourceHeaderRequiredReads = 0;
         int totalProgressMatches = Math.Max(1, ddsMatches.Count);
         int processedProgressMatches = 0;
         foreach (var m in ddsMatches)
@@ -1764,25 +2117,53 @@ public sealed class OverlayService
                 continue;
             }
 
-            // Read only the DDS header needed by PATHC instead of reading the
-            // entire source texture again. For no-mips 50GB+ packs this removes
-            // a massive repeated disk read from the PATHC stage.
-            var headerWatch = Stopwatch.StartNew();
-            byte[] header = ReadDdsHeaderOnly(m.SourcePath, out bool headerFromCache);
-            headerWatch.Stop();
-            sourceHeaderReadSeconds += headerWatch.Elapsed.TotalSeconds;
-            if (headerFromCache) sourceHeaderCacheHits++;
-            else sourceHeaderDiskReads++;
-            if (header.Length < 128 || Encoding.ASCII.GetString(header,0,4) != "DDS ")
+            byte[] rec;
+            uint hForReplay = h;
+            if (TryBuildDdsPathcRecordFromHeader(oe.DdsPathcHeader, recordSize, out rec))
             {
-                string line = displayPath + " | source is not a DDS header";
-                if (skippedSet.Add(line)) skippedPaths.Add(line);
-                continue;
+                cachedHeaderRecordsUsed++;
             }
-            string fourcc = header.Length >= 88 ? Encoding.ASCII.GetString(header, 84, 4) : "";
-            int headSize = fourcc == "DX10" && header.Length >= 148 ? 148 : 128;
-            byte[] rec = new byte[recordSize];
-            Buffer.BlockCopy(header, 0, rec, 0, Math.Min(Math.Min(header.Length, headSize), recordSize));
+            else if (replayDdsRecordByHash.TryGetValue(hForReplay, out var replayRecord))
+            {
+                rec = replayRecord.ToArray();
+                replaySnapshotRecordsUsed++;
+            }
+            else if (TryReadDdsPathcRecordFromOverlayPayload(gameDir, oe, recordSize, out rec, out string overlayPayloadDetail))
+            {
+                overlayPayloadHeaderRecordsUsed++;
+            }
+            else
+            {
+                // Legacy fallback for old manifests that do not yet contain cached
+                // PATHC header snapshots and cannot recover the header from the
+                // installed/held overlay PAZ. New v1.4.2+ manifests should not need
+                // this during Hold/Release or Relink.
+                var headerWatch = Stopwatch.StartNew();
+                byte[] header;
+                try
+                {
+                    header = ReadDdsHeaderOnly(m.SourcePath, out bool headerFromCache);
+                    headerWatch.Stop();
+                    sourceHeaderReadSeconds += headerWatch.Elapsed.TotalSeconds;
+                    if (headerFromCache) sourceHeaderCacheHits++;
+                    else sourceHeaderDiskReads++;
+                    sourceHeaderRequiredReads++;
+                }
+                catch (Exception ex)
+                {
+                    headerWatch.Stop();
+                    string line = displayPath + " | could not acquire DDS PATHC header from cached metadata, PATHC snapshot, overlay payload, or source file: " + ex.Message;
+                    if (skippedSet.Add(line)) skippedPaths.Add(line);
+                    continue;
+                }
+
+                if (!TryBuildDdsPathcRecordFromHeader(header, recordSize, out rec))
+                {
+                    string line = displayPath + " | source is not a DDS header";
+                    if (skippedSet.Add(line)) skippedPaths.Add(line);
+                    continue;
+                }
+            }
             if (!ddsRecordLookup.TryGetValue(rec, out int ddsIdx))
             {
                 pathc.DdsRecords.Add(rec);
@@ -1818,6 +2199,7 @@ public sealed class OverlayService
         log($"Timing: PATHC read: {pathcReadWatch.Elapsed.TotalSeconds:F1}s");
         log($"Timing: PATHC index build: {pathcIndexWatch.Elapsed.TotalSeconds:F1}s");
         log($"Timing: PATHC source DDS header read/acquire: {sourceHeaderReadSeconds:F1}s ({sourceHeaderDiskReads:n0} disk read(s), {sourceHeaderCacheHits:n0} cache hit(s)).");
+        log($"PATHC header replay sources: manifest cache {cachedHeaderRecordsUsed:n0}, PATHC snapshot {replaySnapshotRecordsUsed:n0}, overlay PAZ payload {overlayPayloadHeaderRecordsUsed:n0}, source folder fallback {sourceHeaderRequiredReads:n0}.");
         log($"Timing: PATHC map update: {pathcApplyWatch.Elapsed.TotalSeconds:F1}s");
         log($"Timing: PATHC order rows: {pathcOrderWatch.Elapsed.TotalSeconds:F1}s");
         log($"Timing: PATHC serialize: {pathcSerializeWatch.Elapsed.TotalSeconds:F1}s");
@@ -3583,28 +3965,243 @@ public sealed class OverlayService
         return null;
     }
 
-    public static void RestoreMetaFromBackup(string gameDir, string backupDir, Action<string> log)
+    private static readonly string[] RestorableMetaBackupFiles =
     {
-        int restored = 0;
-        foreach (var rel in new[] { Path.Combine("meta", "0.papgt"), Path.Combine("meta", "0.pathc") })
+        Path.Combine("meta", "0.papgt"),
+        Path.Combine("meta", "0.pathc")
+    };
+
+    private static readonly string[] CapturedMetaBackupFiles =
+    {
+        Path.Combine("meta", "0.papgt"),
+        Path.Combine("meta", "0.pathc"),
+        Path.Combine("meta", "0.paver")
+    };
+
+    private const string MetaBackupInfoFileName = "HDOB_META_BACKUP_INFO.json";
+    private const string ActiveBaseInfoFileName = "HDOB_ACTIVE_BASE_INFO.json";
+
+    public static bool RestoreMetaFromBackup(string gameDir, string backupDir, Action<string> log, bool allowStaleBackup = false)
+    {
+        if (!allowStaleBackup && IsMetaBackupLikelyFromOlderGamePatch(gameDir, backupDir, log))
         {
-            string src = Path.Combine(backupDir, rel); string dst = Path.Combine(gameDir, rel);
-            if (File.Exists(src)) { Directory.CreateDirectory(Path.GetDirectoryName(dst)!); File.Copy(src, dst, true); restored++; log($"Restored {rel} from {backupDir}"); }
+            log($"WARN: skipped restoring stale meta backup from an older game patch: {backupDir}");
+            log("WARN: current game meta was left in place so an old patch backup is not written over the current game installation.");
+            return false;
+        }
+
+        int restored = 0;
+        foreach (var rel in RestorableMetaBackupFiles)
+        {
+            string src = Path.Combine(backupDir, rel);
+            string dst = Path.Combine(gameDir, rel);
+            if (File.Exists(src))
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
+                File.Copy(src, dst, true);
+                restored++;
+                log($"Restored {rel} from {backupDir}");
+            }
         }
         if (restored == 0) throw new FileNotFoundException("The backup does not contain meta/0.papgt or meta/0.pathc.");
+        return true;
     }
 
-    public static string CopyCurrentMetaBackup(string gameDir, Action<string> log)
+    public static string CopyCurrentMetaBackup(string gameDir, Action<string> log, string purpose = "HD Overlay Builder meta backup compatibility guard")
     {
         string stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
         string backupDir = Path.Combine(RegistryRoot(gameDir), "backups", stamp);
+        int suffix = 1;
+        while (Directory.Exists(backupDir))
+            backupDir = Path.Combine(RegistryRoot(gameDir), "backups", $"{stamp}_{suffix++:00}");
         Directory.CreateDirectory(Path.Combine(backupDir, "meta"));
-        foreach (var rel in new[] { Path.Combine("meta", "0.papgt"), Path.Combine("meta", "0.pathc") })
+        foreach (var rel in CapturedMetaBackupFiles)
         {
-            string src = Path.Combine(gameDir, rel); if (File.Exists(src)) File.Copy(src, Path.Combine(backupDir, rel), true);
+            string src = Path.Combine(gameDir, rel);
+            if (File.Exists(src)) File.Copy(src, Path.Combine(backupDir, rel), true);
         }
+        WriteMetaBackupInfo(gameDir, backupDir, purpose, log);
         log($"Meta backup created: {backupDir}");
         return backupDir;
+    }
+
+    private static string CopyPathcReplaySnapshot(string gameDir, string purpose, Action<string> log)
+    {
+        try
+        {
+            string src = Path.Combine(gameDir, "meta", "0.pathc");
+            if (!File.Exists(src))
+            {
+                log("WARN: PATHC replay snapshot skipped because meta/0.pathc does not exist.");
+                return string.Empty;
+            }
+            string safePurpose = SafeName(string.IsNullOrWhiteSpace(purpose) ? "pathc" : purpose);
+            string root = Path.Combine(RegistryRoot(gameDir), "pathc_replay_snapshots", safePurpose + "_" + DateTime.Now.ToString("yyyyMMdd_HHmmss_fff"));
+            Directory.CreateDirectory(root);
+            string dst = Path.Combine(root, "0.pathc");
+            File.Copy(src, dst, true);
+            log($"PATHC replay snapshot saved: {dst}");
+            return dst;
+        }
+        catch (Exception ex)
+        {
+            log($"WARN: could not save PATHC replay snapshot: {ex.Message}");
+            return string.Empty;
+        }
+    }
+
+    private static List<PathcFile> LoadPathcReplaySources(IEnumerable<string> paths, Action<string> log, string label)
+    {
+        var result = new List<PathcFile>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string raw in paths.Where(p => !string.IsNullOrWhiteSpace(p)))
+        {
+            string path = raw;
+            try { path = Path.GetFullPath(raw); } catch { }
+            if (!seen.Add(path)) continue;
+            if (!File.Exists(path))
+            {
+                log($"WARN: {label} PATHC replay snapshot not found: {path}");
+                continue;
+            }
+            try
+            {
+                result.Add(PathcFile.Read(path));
+            }
+            catch (Exception ex)
+            {
+                log($"WARN: {label} PATHC replay snapshot could not be read: {path}: {ex.Message}");
+            }
+        }
+        if (result.Count > 0) log($"{label}: loaded {result.Count} PATHC replay snapshot(s) for source-independent replay.");
+        return result;
+    }
+
+    private static void WriteMetaBackupInfo(string gameDir, string backupDir, string purpose, Action<string> log)
+    {
+        try
+        {
+            var files = new List<Dictionary<string, object?>>();
+            foreach (var rel in CapturedMetaBackupFiles)
+            {
+                string path = Path.Combine(gameDir, rel);
+                if (!File.Exists(path)) continue;
+                var fi = new FileInfo(path);
+                files.Add(new Dictionary<string, object?>
+                {
+                    ["relative_file"] = rel.Replace('\\', '/'),
+                    ["size_bytes"] = fi.Length,
+                    ["modified_utc"] = fi.LastWriteTimeUtc.ToString("o"),
+                    ["sha256"] = Sha256File(path)
+                });
+            }
+
+            WriteJson(Path.Combine(backupDir, MetaBackupInfoFileName), new
+            {
+                app = AppName,
+                version = AppVersion,
+                created_at_utc = DateTime.UtcNow.ToString("o"),
+                game_dir = gameDir,
+                purpose = purpose,
+                files = files
+            });
+        }
+        catch (Exception ex)
+        {
+            log($"WARN: could not write meta backup info: {ex.Message}");
+        }
+    }
+
+    private static string Sha256File(string path)
+    {
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 1024 * 1024, FileOptions.SequentialScan);
+        return Convert.ToHexString(SHA256.HashData(fs)).ToLowerInvariant();
+    }
+
+    private static bool IsMetaBackupLikelyFromOlderGamePatch(string gameDir, string backupDir, Action<string> log)
+    {
+        try
+        {
+            string currentPaver = Path.Combine(gameDir, "meta", "0.paver");
+            string backupPaver = Path.Combine(backupDir, "meta", "0.paver");
+
+            // Newer backups capture meta/0.paver as a direct game-patch marker.
+            // If the backup's paver differs from the current game's paver, the backup
+            // belongs to another game patch and must not be restored over the live install.
+            if (File.Exists(currentPaver) && File.Exists(backupPaver))
+            {
+                var c = new FileInfo(currentPaver);
+                var b = new FileInfo(backupPaver);
+                if (c.Length != b.Length || !string.Equals(Sha256File(currentPaver), Sha256File(backupPaver), StringComparison.OrdinalIgnoreCase))
+                {
+                    log("WARN: meta backup guard detected a different meta/0.paver than the current game patch.");
+                    return true;
+                }
+                return false;
+            }
+
+            // Older backups did not include 0.paver. For those, use the backup folder
+            // timestamp against the latest stock meta/PAMT timestamp. This prevents an
+            // old v1.12 backup from being restored after the game has moved to v1.13+.
+            DateTime? backupUtc = TryGetBackupFolderTimestampUtc(backupDir);
+            DateTime? currentBasisUtc = LatestCurrentGameBasisTimestampUtc(gameDir);
+            if (backupUtc.HasValue && currentBasisUtc.HasValue && backupUtc.Value.AddMinutes(2) < currentBasisUtc.Value)
+            {
+                log($"WARN: meta backup guard detected backup timestamp {backupUtc.Value:o} older than current game basis {currentBasisUtc.Value:o}.");
+                return true;
+            }
+        }
+        catch (Exception ex)
+        {
+            log($"WARN: meta backup guard could not fully validate backup age ({ex.Message}); restore will continue.");
+        }
+        return false;
+    }
+
+    private static DateTime? TryGetBackupFolderTimestampUtc(string backupDir)
+    {
+        string name = Path.GetFileName(backupDir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+        string timestampPart = name.Length >= 15 ? name[..15] : name;
+        if (DateTime.TryParseExact(timestampPart, "yyyyMMdd_HHmmss", CultureInfo.InvariantCulture, DateTimeStyles.AssumeLocal, out var local))
+        {
+            return local.ToUniversalTime();
+        }
+        try
+        {
+            if (Directory.Exists(backupDir)) return Directory.GetCreationTimeUtc(backupDir);
+        }
+        catch { }
+        return null;
+    }
+
+    private static DateTime? LatestCurrentGameBasisTimestampUtc(string gameDir)
+    {
+        DateTime latest = DateTime.MinValue;
+        foreach (var path in EnumerateCurrentGameBasisFiles(gameDir))
+        {
+            try
+            {
+                var t = File.GetLastWriteTimeUtc(path);
+                if (t > latest) latest = t;
+            }
+            catch { }
+        }
+        return latest == DateTime.MinValue ? null : latest;
+    }
+
+    private static IEnumerable<string> EnumerateCurrentGameBasisFiles(string gameDir)
+    {
+        foreach (var rel in CapturedMetaBackupFiles)
+        {
+            string p = Path.Combine(gameDir, rel);
+            if (File.Exists(p)) yield return p;
+        }
+
+        foreach (var dir in Directory.EnumerateDirectories(gameDir).Where(d => Regex.IsMatch(Path.GetFileName(d), @"^\d{4}$")))
+        {
+            string pamt = Path.Combine(dir, "0.pamt");
+            if (File.Exists(pamt)) yield return pamt;
+        }
     }
     private static void WriteManagedOverlayMarker(string overlayDirPath, string overlayDir, BuildOptions options)
     {
@@ -3953,21 +4550,34 @@ public sealed class OverlayService
 
     private static void RestoreRegistryStateBackup(string gameDir, string backupDir, Action<string>? log)
     {
+        string stagingRoot = string.Empty;
         try
         {
             string root = Path.Combine(backupDir, "registry_state");
             if (!Directory.Exists(root)) return;
+
+            // The backup itself lives under HDOverlayBuilder\backups. Stage it
+            // outside the managed registry roots before deleting/replacing those
+            // roots, otherwise restoring HDOverlayBuilder would delete the source
+            // backup tree before it can be copied back.
+            stagingRoot = Path.Combine(Path.GetTempPath(), "HDOB_registry_restore_" + Guid.NewGuid().ToString("N"));
+            CopyDirectory(root, stagingRoot);
+
             foreach (var folderName in new[] { ToolDataFolderName, PreviousToolDataFolderName, LegacyToolDataFolderName }.Distinct(StringComparer.OrdinalIgnoreCase))
             {
-                string src = Path.Combine(root, folderName);
+                string src = Path.Combine(stagingRoot, folderName);
                 if (!Directory.Exists(src)) continue;
                 string dst = Path.Combine(gameDir, folderName);
-                try { if (Directory.Exists(dst)) Directory.Delete(dst, true); } catch { }
+                if (Directory.Exists(dst)) Directory.Delete(dst, true);
                 CopyDirectory(src, dst);
             }
             log?.Invoke("Registry/state restored from pre-operation backup.");
         }
         catch (Exception ex) { log?.Invoke($"WARN: could not restore registry/state backup: {ex.Message}"); }
+        finally
+        {
+            try { if (!string.IsNullOrWhiteSpace(stagingRoot) && Directory.Exists(stagingRoot)) Directory.Delete(stagingRoot, true); } catch { }
+        }
     }
 
     public static BuildResult RelinkOverlaysAfterGameUpdate(string gameDir, Action<string> log, Action<int, string>? progress = null, CancellationToken cancellationToken = default)
@@ -3982,26 +4592,69 @@ public sealed class OverlayService
         var mods = ObjMods(reg).Where(m => IsTextureMod(m) && string.Equals(SObj(m, "status").DefaultIfEmpty("active"), "active", StringComparison.OrdinalIgnoreCase)).OrderBy(m => SObj(m, "created_at")).ToList();
         if (mods.Count == 0) throw new InvalidOperationException("No active managed HD overlay build registry was found. Use Easy Apply for a full rebuild.");
 
-        var allMatches = new List<MatchedFile>();
-        var allEntries = new List<OverlayEntry>();
+        // Relink may see the same historical target in more than one active
+        // manifest after Update Existing Build rebuilt an already-owned HD##
+        // overlay. Canonicalize those records before PATHC replay so duplicate
+        // history cannot make a valid overlay entry look ambiguous/non-editable.
+        var canonicalMatchesByTarget = new Dictionary<string, (int ManifestOrder, long Sequence, MatchedFile Match)>(StringComparer.OrdinalIgnoreCase);
+        var canonicalEntriesByOwnerTarget = new Dictionary<string, (int ManifestOrder, long Sequence, string TargetKey, OverlayEntry Entry)>(StringComparer.OrdinalIgnoreCase);
         var modifiedPamts = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
         var validatedOverlays = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         string relinkReportPath = Path.Combine(RegistryRoot(gameDir), "relink_reports", $"relink_report_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
-        int matchedCount = 0;
+        var pathcReplaySnapshotPaths = new List<string>();
+        int rawMatchRecordCount = 0;
+        int rawOverlayEntryRecordCount = 0;
+        int duplicateMatchRecordsCollapsed = 0;
+        int duplicateSameOwnerEntryRecordsCollapsed = 0;
+        int manifestOrder = 0;
+        long canonicalSequence = 0;
 
         progress?.Invoke(10, "RELINK: VALIDATE OVERLAYS");
         foreach (var mod in mods)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            manifestOrder++;
             string mp = SObj(mod, "manifest_copy");
             if (string.IsNullOrWhiteSpace(mp) || !File.Exists(mp)) mp = SObj(mod, "original_manifest");
             if (string.IsNullOrWhiteSpace(mp) || !File.Exists(mp)) throw new InvalidOperationException($"Active build {SObj(mod, "mod_id")} has no readable manifest. Full Easy Apply is required.");
+            var manifestInfo = ReadJsonDict(mp);
+            if (manifestInfo != null)
+            {
+                string snap = SObj(manifestInfo, "pathc_replay_snapshot");
+                if (!string.IsNullOrWhiteSpace(snap)) pathcReplaySnapshotPaths.Add(snap);
+            }
+            string heldSnap = SObj(mod, "pathc_hold_snapshot");
+            if (!string.IsNullOrWhiteSpace(heldSnap)) pathcReplaySnapshotPaths.Add(heldSnap);
             var matches = ReadManifestMatches(mp);
             var entries = ReadManifestOverlayEntries(mp);
             if (matches.Count == 0 || entries.Count == 0) throw new InvalidOperationException($"Active build manifest is incomplete: {mp}. Full Easy Apply is required.");
-            allMatches.AddRange(matches);
-            allEntries.AddRange(entries);
-            matchedCount += matches.Count;
+
+            foreach (var match in matches)
+            {
+                rawMatchRecordCount++;
+                string targetKey = RelinkMatchTargetKey(match);
+                if (string.IsNullOrWhiteSpace(targetKey))
+                    throw new InvalidOperationException($"Active build manifest contains a match with no usable target path: {mp}");
+                canonicalSequence++;
+                if (canonicalMatchesByTarget.ContainsKey(targetKey)) duplicateMatchRecordsCollapsed++;
+                // Mods/manifests are processed oldest to newest. Assignment means
+                // the newest active manifest wins for an updated target.
+                canonicalMatchesByTarget[targetKey] = (manifestOrder, canonicalSequence, match);
+            }
+
+            foreach (var entry in entries)
+            {
+                rawOverlayEntryRecordCount++;
+                string targetKey = RelinkOverlayTargetKey(entry);
+                if (string.IsNullOrWhiteSpace(targetKey))
+                    throw new InvalidOperationException($"Active build manifest contains an overlay entry with no usable target path: {mp}");
+                string ownerKey = RelinkOverlayOwnerKey(entry);
+                string ownerTargetKey = targetKey + "\u001f" + ownerKey;
+                canonicalSequence++;
+                if (canonicalEntriesByOwnerTarget.ContainsKey(ownerTargetKey)) duplicateSameOwnerEntryRecordsCollapsed++;
+                // First collapse duplicate history for the same target + HD## owner.
+                canonicalEntriesByOwnerTarget[ownerTargetKey] = (manifestOrder, canonicalSequence, targetKey, entry);
+            }
 
             foreach (var od in StringListObj(mod.GetValueOrDefault("overlay_dirs")).Distinct(StringComparer.OrdinalIgnoreCase))
             {
@@ -4026,26 +4679,96 @@ public sealed class OverlayService
             }
         }
 
+        var allMatches = canonicalMatchesByTarget.Values
+            .OrderBy(v => v.ManifestOrder)
+            .ThenBy(v => v.Sequence)
+            .Select(v => v.Match)
+            .ToList();
+
+        int duplicateCrossOwnerEntryRecordsCollapsed = 0;
+        var allEntries = new List<OverlayEntry>();
+        foreach (var group in canonicalEntriesByOwnerTarget.Values
+                     .GroupBy(v => v.TargetKey, StringComparer.OrdinalIgnoreCase)
+                     .OrderBy(g => g.Key, StringComparer.OrdinalIgnoreCase))
+        {
+            var newest = group
+                .OrderByDescending(v => v.ManifestOrder)
+                .ThenByDescending(v => v.Sequence)
+                .First();
+            allEntries.Add(newest.Entry);
+            duplicateCrossOwnerEntryRecordsCollapsed += Math.Max(0, group.Count() - 1);
+        }
+
+        int duplicateHistoricalRecordsCollapsed = duplicateMatchRecordsCollapsed
+            + duplicateSameOwnerEntryRecordsCollapsed
+            + duplicateCrossOwnerEntryRecordsCollapsed;
+        int matchedCount = allMatches.Count;
+        log($"Relink canonicalization: {rawMatchRecordCount:n0} historical match record(s) -> {matchedCount:n0} unique managed target(s).");
+        log($"Relink canonicalization: {rawOverlayEntryRecordCount:n0} historical overlay entry record(s) -> {allEntries.Count:n0} canonical target entry/entries.");
+        log($"Relink canonicalization collapsed {duplicateHistoricalRecordsCollapsed:n0} duplicate historical record(s): " +
+            $"matches {duplicateMatchRecordsCollapsed:n0}, same target/owner entries {duplicateSameOwnerEntryRecordsCollapsed:n0}, overlapping owner candidates {duplicateCrossOwnerEntryRecordsCollapsed:n0}.");
+
+        var relinkReplaySources = LoadPathcReplaySources(pathcReplaySnapshotPaths, log, "Relink");
+        if (ShouldUseExternalDriveSafeModeForSelectedFolders(gameDir, gameDir, out string relinkStorageSummary))
+            log("Relink storage notice: slow or external game storage detected. Relink is transactional, but external/slow storage can still make validation and meta writes slower. " + relinkStorageSummary);
+        else if (!string.IsNullOrWhiteSpace(relinkStorageSummary))
+            log("[runtime] Relink " + relinkStorageSummary);
+
+        var previousBaseSelection = ResolveManagedBaseBackup(gameDir, reg, mods, "Relink", log, migrateLatestRelink: false);
+        string previousActiveBaseBackup = previousBaseSelection.BackupDir;
+        long previousActiveBaseRevision = Math.Max(RegistryActiveBaseRevision(reg), previousBaseSelection.Revision);
+        log($"Relink managed base before rebase: revision {previousActiveBaseRevision}; backup: {previousActiveBaseBackup.DefaultIfEmpty("<none registered>")}; source: {previousBaseSelection.Source}.");
+
         string backupDir = string.Empty;
+        long newActiveBaseRevision = previousActiveBaseRevision;
         bool relinkWritesStarted = false;
+        List<string>? relinkFailureReportLines = null;
         try
         {
-            backupDir = CopyCurrentMetaBackup(gameDir, log);
+            backupDir = CopyCurrentMetaBackup(gameDir, log, "Candidate current non-HDOB underlay captured before Relink replay");
+            log($"Relink candidate new managed base captured before overlay replay: {backupDir}");
             CopyRegistryStateBackup(gameDir, backupDir, log);
             DebugFailureInjector.Check(DebugFailureInjector.RelinkAfterMetaBackup, log);
             progress?.Invoke(35, "RELINK: PATHC");
-            var pathc = UpdatePathcForMatches(gameDir, allMatches, allEntries, log, progress, 35, 82, "RELINK PATHC");
+            var pathc = UpdatePathcForMatches(gameDir, allMatches, allEntries, log, progress, 35, 82, "RELINK PATHC", relinkReplaySources);
             if (pathc.bytes == null) throw new InvalidOperationException("Relink could not update PATHC. Full Easy Apply may be required.");
-            if (pathc.summary.Skipped > 0 || pathc.summary.PackedWithoutEditableMetadata > 0)
+
+            int expectedManagedDdsTargets = allMatches.Count;
+            int resolvedManagedDdsTargets = pathc.summary.Updated + pathc.summary.Added + pathc.summary.Unchanged;
+            bool unresolvedManagedTargets = pathc.summary.Skipped > 0
+                || pathc.summary.PackedWithoutEditableMetadata > 0
+                || resolvedManagedDdsTargets != expectedManagedDdsTargets;
+            if (unresolvedManagedTargets)
             {
-                string packedPart = pathc.summary.PackedWithoutEditableMetadata == 1
-                    ? "1 packed non-editable metadata row"
-                    : $"{pathc.summary.PackedWithoutEditableMetadata} packed non-editable metadata rows";
-                string skippedPart = pathc.summary.Skipped == 1
-                    ? "1 skipped metadata row"
-                    : $"{pathc.summary.Skipped} skipped metadata rows";
-                log($"WARN: Relink PATHC completed with {packedPart} and {skippedPart}. Review the report/log if the game update changed these targets.");
+                relinkFailureReportLines = new List<string>
+                {
+                    $"{AppName} {AppVersion} - Relink Overlays After Game Update - ABORTED BEFORE COMMIT",
+                    $"Created: {DateTime.Now:s}",
+                    $"Game: {gameDir}",
+                    $"Historical match records scanned: {rawMatchRecordCount:n0}",
+                    $"Unique managed targets expected: {expectedManagedDdsTargets:n0}",
+                    $"Unique managed targets resolved: {resolvedManagedDdsTargets:n0}",
+                    $"Duplicate historical records collapsed: {duplicateHistoricalRecordsCollapsed:n0}",
+                    $"  Match records: {duplicateMatchRecordsCollapsed:n0}",
+                    $"  Same target/owner overlay entries: {duplicateSameOwnerEntryRecordsCollapsed:n0}",
+                    $"  Overlapping owner candidates: {duplicateCrossOwnerEntryRecordsCollapsed:n0}",
+                    $"PATHC: {pathc.summary.Updated} updated / {pathc.summary.Added} added / {pathc.summary.Unchanged} unchanged / {pathc.summary.PackedWithoutEditableMetadata} unresolved packed/non-editable / {pathc.summary.Skipped} skipped",
+                    "",
+                    "UNRESOLVED PACKED/NON-EDITABLE TARGETS:"
+                };
+                relinkFailureReportLines.AddRange(pathc.summary.PackedWithoutEditableMetadataPaths);
+                relinkFailureReportLines.Add("");
+                relinkFailureReportLines.Add("SKIPPED TARGETS:");
+                relinkFailureReportLines.AddRange(pathc.summary.SkippedPaths);
+
+                log($"ERROR: Relink resolved {resolvedManagedDdsTargets:n0} of {expectedManagedDdsTargets:n0} unique managed DDS target(s); " +
+                    $"{pathc.summary.PackedWithoutEditableMetadata:n0} unresolved packed/non-editable and {pathc.summary.Skipped:n0} skipped. No relink meta changes were committed.");
+                throw new InvalidOperationException(
+                    $"Relink aborted before commit because {Math.Max(0, expectedManagedDdsTargets - resolvedManagedDdsTargets):n0} managed target(s) were not resolved safely. " +
+                    "The pre-relink meta and managed registry/state will be restored.");
             }
+
+            log($"Relink PATHC resolution complete: {resolvedManagedDdsTargets:n0}/{expectedManagedDdsTargets:n0} unique managed DDS target(s) resolved. Commit is now allowed.");
             relinkWritesStarted = true;
             SafeWrite(Path.Combine(gameDir, "meta", "0.pathc"), pathc.bytes);
 
@@ -4055,10 +4778,18 @@ public sealed class OverlayService
 
             progress?.Invoke(94, "RELINK: REGISTRY");
             DebugFailureInjector.Check(DebugFailureInjector.RelinkBeforeRegistryRefresh, log);
+            newActiveBaseRevision = Math.Max(1L, previousActiveBaseRevision + 1L);
             reg["last_relink_after_game_update_at"] = DateTime.Now.ToString("s");
             reg["last_relink_game_root_hash"] = GameRootCacheHash(gameDir);
             reg["last_relink_overlay_dirs"] = validatedOverlays.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToList();
+            reg["active_base_backup_dir"] = backupDir;
+            reg["active_base_revision"] = newActiveBaseRevision;
+            reg["active_base_updated_at"] = DateTime.Now.ToString("s");
+            reg["active_base_update_reason"] = "Successful Relink rebased current non-HDOB underlay";
+            reg["active_base_previous_backup_dir"] = previousActiveBaseBackup;
             SaveRegistry(gameDir, reg);
+            WriteActiveBaseInfo(backupDir, newActiveBaseRevision, "Successful Relink rebased current non-HDOB underlay", previousActiveBaseBackup, log);
+            log($"Relink managed base rebased successfully: revision {newActiveBaseRevision}; new base backup: {backupDir}; previous base backup: {previousActiveBaseBackup.DefaultIfEmpty("<none registered>")}.");
             var relinkDirs = validatedOverlays.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToList();
             log($"Relink complete. Existing overlays relinked against current game meta: {string.Join(", ", relinkDirs)}.");
             try
@@ -4069,11 +4800,22 @@ public sealed class OverlayService
                     $"{AppName} {AppVersion} - Relink Overlays After Game Update",
                     $"Created: {DateTime.Now:s}",
                     $"Game: {gameDir}",
-                    $"Matched manifest records replayed: {matchedCount:n0}",
+                    $"Historical match records scanned: {rawMatchRecordCount:n0}",
+                    $"Unique managed targets replayed: {matchedCount:n0}",
+                    $"Historical overlay entry records scanned: {rawOverlayEntryRecordCount:n0}",
+                    $"Canonical overlay target entries used: {allEntries.Count:n0}",
+                    $"Duplicate historical records collapsed: {duplicateHistoricalRecordsCollapsed:n0}",
+                    $"  Match records: {duplicateMatchRecordsCollapsed:n0}",
+                    $"  Same target/owner overlay entries: {duplicateSameOwnerEntryRecordsCollapsed:n0}",
+                    $"  Overlapping owner candidates: {duplicateCrossOwnerEntryRecordsCollapsed:n0}",
                     $"Overlay folders validated: {string.Join(", ", relinkDirs)}",
                     $"PATHC: {pathc.summary.Updated} updated / {pathc.summary.Added} added / {pathc.summary.Unchanged} unchanged / {pathc.summary.Skipped} skipped",
                     $"PATHC packed without editable metadata: {pathc.summary.PackedWithoutEditableMetadata}",
-                    $"PATHC total rows: {pathc.summary.TotalRows} (was {pathc.summary.StartingRows})"
+                    $"PATHC total rows: {pathc.summary.TotalRows} (was {pathc.summary.StartingRows})",
+                    $"Previous active base revision: {previousActiveBaseRevision}",
+                    $"Previous active base backup: {previousActiveBaseBackup.DefaultIfEmpty("<none registered>")}",
+                    $"New active base revision: {newActiveBaseRevision}",
+                    $"New active base backup: {backupDir}"
                 }, Encoding.UTF8);
             }
             catch { }
@@ -4099,6 +4841,19 @@ public sealed class OverlayService
                 RestoreRegistryStateBackup(gameDir, backupDir, log);
             }
             log("Relink rollback cleanup complete.");
+            if (relinkFailureReportLines != null)
+            {
+                try
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(relinkReportPath)!);
+                    File.WriteAllLines(relinkReportPath, relinkFailureReportLines, Encoding.UTF8);
+                    log($"Relink failure report: {relinkReportPath}");
+                }
+                catch (Exception reportEx)
+                {
+                    log($"WARN: could not preserve Relink failure report after rollback: {reportEx.Message}");
+                }
+            }
             throw;
         }
     }
@@ -4445,6 +5200,149 @@ public sealed class OverlayService
         return 0L;
     }
 
+    private sealed record ManagedBaseSelection(string BackupDir, long Revision, string Source, bool Migrated, bool RelinkMarkerPresent);
+
+    private static long RegistryActiveBaseRevision(Dictionary<string, object?> reg)
+    {
+        try
+        {
+            if (reg.TryGetValue("active_base_revision", out var raw))
+            {
+                if (raw is long l) return l;
+                if (raw is int i) return i;
+                if (raw is double d) return (long)d;
+                if (long.TryParse(Convert.ToString(raw), out var parsed)) return parsed;
+            }
+        }
+        catch { }
+        return 0L;
+    }
+
+    private static string RegistryActiveBaseBackupDir(Dictionary<string, object?> reg)
+        => SObj(reg, "active_base_backup_dir");
+
+    private static DateTime? ParseRegistryLocalTimestampUtc(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return null;
+        if (DateTime.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.AssumeLocal, out var parsed))
+            return parsed.ToUniversalTime();
+        return null;
+    }
+
+    private static IEnumerable<string> EnumerateMetaBackupDirectories(string gameDir)
+    {
+        foreach (var root in RegistryRoots(gameDir).Select(r => Path.Combine(r, "backups")).Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            if (!Directory.Exists(root)) continue;
+            foreach (var dir in Directory.EnumerateDirectories(root))
+            {
+                if (File.Exists(Path.Combine(dir, "meta", "0.pathc")) || File.Exists(Path.Combine(dir, "meta", "0.papgt")))
+                    yield return dir;
+            }
+        }
+    }
+
+    private static string LegacyManifestBaseBackup(IEnumerable<Dictionary<string, object?>> mods)
+    {
+        var earliestManifest = mods
+            .Select(m => ReadJsonDict(SObj(m, "manifest_copy")) ?? ReadJsonDict(SObj(m, "original_manifest")))
+            .Where(m => m != null)
+            .OrderBy(m => SObj(m!, "created_at"))
+            .FirstOrDefault();
+        return earliestManifest != null ? SObj(earliestManifest, "backup_dir") : string.Empty;
+    }
+
+    private static string FindLatestSuccessfulRelinkBaseCandidate(string gameDir, Dictionary<string, object?> reg)
+    {
+        DateTime? relinkUtc = ParseRegistryLocalTimestampUtc(SObj(reg, "last_relink_after_game_update_at"));
+        if (!relinkUtc.HasValue) return string.Empty;
+
+        var candidates = EnumerateMetaBackupDirectories(gameDir)
+            .Select(path => new { Path = path, TimestampUtc = TryGetBackupFolderTimestampUtc(path) })
+            .Where(x => x.TimestampUtc.HasValue && x.TimestampUtc.Value <= relinkUtc.Value.AddMinutes(2))
+            .Where(x => !IsMetaBackupLikelyFromOlderGamePatch(gameDir, x.Path, _ => { }))
+            .OrderBy(x => x.TimestampUtc)
+            .ToList();
+        return candidates.LastOrDefault()?.Path ?? string.Empty;
+    }
+
+    private static void WriteActiveBaseInfo(string backupDir, long revision, string reason, string previousBackupDir, Action<string> log)
+    {
+        try
+        {
+            WriteJson(Path.Combine(backupDir, ActiveBaseInfoFileName), new
+            {
+                app = AppName,
+                version = AppVersion,
+                active_base_revision = revision,
+                registered_at_utc = DateTime.UtcNow.ToString("o"),
+                reason,
+                previous_active_base_backup_dir = previousBackupDir,
+                backup_dir = backupDir
+            });
+        }
+        catch (Exception ex)
+        {
+            log($"WARN: could not write active managed base marker: {ex.Message}");
+        }
+    }
+
+    private static ManagedBaseSelection ResolveManagedBaseBackup(
+        string gameDir,
+        Dictionary<string, object?> reg,
+        IEnumerable<Dictionary<string, object?>> mods,
+        string operation,
+        Action<string> log,
+        bool migrateLatestRelink)
+    {
+        string active = RegistryActiveBaseBackupDir(reg);
+        long revision = RegistryActiveBaseRevision(reg);
+        DateTime? latestRelinkUtc = ParseRegistryLocalTimestampUtc(SObj(reg, "last_relink_after_game_update_at"));
+        DateTime? activeBaseUpdatedUtc = ParseRegistryLocalTimestampUtc(SObj(reg, "active_base_updated_at"));
+        bool relinkMarkerPresent = latestRelinkUtc.HasValue;
+        bool activePointerPredatesLatestRelink = relinkMarkerPresent
+            && (!activeBaseUpdatedUtc.HasValue || activeBaseUpdatedUtc.Value.AddSeconds(1) < latestRelinkUtc!.Value);
+
+        if (!string.IsNullOrWhiteSpace(active) && Directory.Exists(active) && !activePointerPredatesLatestRelink)
+        {
+            if (!IsMetaBackupLikelyFromOlderGamePatch(gameDir, active, _ => { }))
+                return new ManagedBaseSelection(active, revision, "active managed base pointer", false, relinkMarkerPresent);
+            log($"WARN: {operation}: active managed base points to a different game patch and will not be restored: {active}");
+        }
+        else if (!string.IsNullOrWhiteSpace(active) && activePointerPredatesLatestRelink)
+        {
+            log($"WARN: {operation}: active managed base revision {revision} predates the latest successful Relink and will be rebased from Relink history before restore: {active}");
+        }
+
+        if (relinkMarkerPresent)
+        {
+            string migrated = FindLatestSuccessfulRelinkBaseCandidate(gameDir, reg);
+            if (!string.IsNullOrWhiteSpace(migrated))
+            {
+                long migratedRevision = Math.Max(1L, revision + 1L);
+                if (migrateLatestRelink)
+                {
+                    string previous = active;
+                    reg["active_base_backup_dir"] = migrated;
+                    reg["active_base_revision"] = migratedRevision;
+                    reg["active_base_updated_at"] = DateTime.Now.ToString("s");
+                    reg["active_base_update_reason"] = "Recovered managed base from latest successful Relink";
+                    reg["active_base_previous_backup_dir"] = previous;
+                    SaveRegistry(gameDir, reg);
+                    WriteActiveBaseInfo(migrated, migratedRevision, "Recovered managed base from latest successful Relink", previous, log);
+                    log($"{operation}: migrated the latest successful Relink base into managed state. Active base revision {migratedRevision}: {migrated}");
+                }
+                return new ManagedBaseSelection(migrated, migratedRevision, "latest successful Relink recovery", migrateLatestRelink, true);
+            }
+
+            log($"ERROR: {operation}: a successful Relink is recorded, but its pre-overlay base backup could not be recovered. The older original build backup will not be restored silently.");
+            return new ManagedBaseSelection(string.Empty, revision, "unresolved latest Relink base", false, true);
+        }
+
+        string legacy = LegacyManifestBaseBackup(mods);
+        return new ManagedBaseSelection(legacy, revision, "legacy earliest build manifest", false, false);
+    }
+
     private static long IncrementActiveBuildRevision(string gameDir, string reason, Action<string>? log)
     {
         var reg = LoadRegistry(gameDir);
@@ -4535,7 +5433,7 @@ public sealed class OverlayService
         }
     }
 
-    private static void RegisterAppliedManifest(string gameDir, string manifestPath, Dictionary<string, object?> manifest, Action<string> log)
+    private static void RegisterAppliedManifest(string gameDir, string manifestPath, Dictionary<string, object?> manifest, Action<string> log, bool initializeManagedBase)
     {
         string manDir = RegistryManifestDir(gameDir);
         Directory.CreateDirectory(manDir);
@@ -4554,6 +5452,20 @@ public sealed class OverlayService
         reg["active_build_revision"] = nextRevision;
         reg["last_content_update_at"] = DateTime.Now.ToString("s");
         reg["last_content_update_reason"] = "Easy Apply / full apply registered managed overlay build";
+        string initialBaseBackup = SObj(manifest, "backup_dir");
+        if (initializeManagedBase
+            && string.IsNullOrWhiteSpace(RegistryActiveBaseBackupDir(reg))
+            && !string.IsNullOrWhiteSpace(initialBaseBackup)
+            && Directory.Exists(initialBaseBackup))
+        {
+            long initialBaseRevision = Math.Max(1L, RegistryActiveBaseRevision(reg));
+            reg["active_base_backup_dir"] = initialBaseBackup;
+            reg["active_base_revision"] = initialBaseRevision;
+            reg["active_base_updated_at"] = DateTime.Now.ToString("s");
+            reg["active_base_update_reason"] = "Initial managed base captured before Easy Apply / full apply";
+            WriteActiveBaseInfo(initialBaseBackup, initialBaseRevision, "Initial managed base captured before Easy Apply / full apply", string.Empty, log);
+            log($"Initial managed base registered. Revision {initialBaseRevision}: {initialBaseBackup}");
+        }
         SaveRegistry(gameDir, reg);
         log($"Master registry updated: {RegistryPath(gameDir)}");
         log($"Active build revision updated to {nextRevision} (Easy Apply / full apply registered managed overlay build).");
@@ -4583,18 +5495,30 @@ public sealed class OverlayService
         log("Remove current build: backing up current meta before restore/delete...");
         CopyCurrentMetaBackup(gameDir, log);
 
-        // Best effort PATHC restore from the build's captured backup. This mirrors the old tool's safe fallback.
+        // Restore the currently registered managed underlay. After a successful
+        // Relink this points to the pre-Relink stock/mod-manager meta, not the
+        // original pre-update Easy Apply backup.
         progress?.Invoke(22, "REMOVE: RESTORE BASE META");
-        log("Remove current build: restoring base meta/PATHC from build backup when available...");
-        foreach (var mod in targets)
+        log("Remove current build: resolving the current managed base meta/PATHC backup...");
+        var removeBase = ResolveManagedBaseBackup(gameDir, reg, targets, "Remove Current Build", log, migrateLatestRelink: true);
+        if (removeBase.RelinkMarkerPresent && string.IsNullOrWhiteSpace(removeBase.BackupDir))
+            throw new InvalidOperationException("Remove Current Build stopped because the latest successful Relink base could not be recovered safely. Verify game files or run Relink again before removing the managed build.");
+        log($"Remove Current Build will restore managed base revision {removeBase.Revision} from: {removeBase.BackupDir.DefaultIfEmpty("<no backup available>")} (source: {removeBase.Source}).");
+        bool removeBaseMetaRestored = false;
+        if (!string.IsNullOrWhiteSpace(removeBase.BackupDir) && Directory.Exists(removeBase.BackupDir))
         {
-            var manifest = ReadJsonDict(SObj(mod, "manifest_copy")) ?? ReadJsonDict(SObj(mod, "original_manifest"));
-            string backupDir = manifest != null ? SObj(manifest, "backup_dir") : "";
-            if (!string.IsNullOrWhiteSpace(backupDir) && Directory.Exists(backupDir))
+            try
             {
-                try { RestoreMetaFromBackup(gameDir, backupDir, log); break; }
-                catch (Exception ex) { log($"WARN: could not restore base backup from manifest: {ex.Message}"); }
+                removeBaseMetaRestored = RestoreMetaFromBackup(gameDir, removeBase.BackupDir, log);
+                if (removeBaseMetaRestored)
+                    log($"Remove Current Build restored exact managed base backup: {removeBase.BackupDir}");
             }
+            catch (Exception ex) { log($"WARN: could not restore managed base backup: {ex.Message}"); }
+        }
+        if (!removeBaseMetaRestored)
+        {
+            log("WARN: Remove current build did not restore a base meta backup. This is expected when the registered build backup is from an older game patch.");
+            log("WARN: overlays will still be deleted and PAPGT rebuilt against the current game files. If Steam still reports an installation problem, verify game files once.");
         }
 
         int changed = 0;
@@ -4746,7 +5670,8 @@ public sealed class OverlayService
         progress?.Invoke(65, "HOLD: RESTORE BASE META");
         if (!string.IsNullOrWhiteSpace(baseBackup) && Directory.Exists(baseBackup))
         {
-            RestoreMetaFromBackup(gameDir, baseBackup, log);
+            if (!RestoreMetaFromBackup(gameDir, baseBackup, log))
+                log("WARN: Remove selected builds skipped the first build backup because it appears to be from an older game patch.");
         }
         else
         {
@@ -4855,8 +5780,17 @@ public sealed class OverlayService
         var mods = ObjMods(reg);
         var active = mods.Where(m => IsTextureMod(m) && !string.Equals(SObj(m, "status"), "held", StringComparison.OrdinalIgnoreCase)).ToList();
         if (active.Count == 0) throw new InvalidOperationException("No active registered overlays were found for Hold.");
+        var holdBase = ResolveManagedBaseBackup(gameDir, reg, active, "Smart Overlay Hold", log, migrateLatestRelink: true);
+        if (holdBase.RelinkMarkerPresent && string.IsNullOrWhiteSpace(holdBase.BackupDir))
+            throw new InvalidOperationException("Smart Overlay Hold stopped because the latest successful Relink base could not be recovered safely. Verify game files or run Relink again before using Hold.");
+        if (!string.IsNullOrWhiteSpace(holdBase.BackupDir)
+            && IsMetaBackupLikelyFromOlderGamePatch(gameDir, holdBase.BackupDir, _ => { }))
+            throw new InvalidOperationException("Smart Overlay Hold stopped because the registered managed base belongs to an older game patch. Relink against the current game meta before using Hold.");
+        log($"Smart Overlay Hold will restore managed base revision {holdBase.Revision} from: {holdBase.BackupDir.DefaultIfEmpty("<no backup available>")} (source: {holdBase.Source}).");
+
         progress?.Invoke(8, "HOLD: BACKUP META");
-        CopyCurrentMetaBackup(gameDir, log);
+        CopyCurrentMetaBackup(gameDir, log, "Pre-Hold overlay-applied meta safety backup");
+        string pathcHoldSnapshot = CopyPathcReplaySnapshot(gameDir, "hold", log);
         string holdRoot = RegistryHoldRoot(gameDir);
         int moved = 0;
         int totalToMove = active.Sum(m => StringListObj(m.GetValueOrDefault("overlay_dirs")).Count);
@@ -4889,23 +5823,21 @@ public sealed class OverlayService
             }
             mod["status"] = "held";
             mod["held_at"] = DateTime.Now.ToString("s");
+            if (!string.IsNullOrWhiteSpace(pathcHoldSnapshot)) mod["pathc_hold_snapshot"] = pathcHoldSnapshot;
             mod["held_overlays"] = held;
         }
-        var earliestManifest = active
-            .Select(m => ReadJsonDict(SObj(m, "manifest_copy")) ?? ReadJsonDict(SObj(m, "original_manifest")))
-            .Where(m => m != null)
-            .OrderBy(m => SObj(m!, "created_at"))
-            .FirstOrDefault();
-        string baseBackup = earliestManifest != null ? SObj(earliestManifest, "backup_dir") : "";
+        string baseBackup = holdBase.BackupDir;
         progress?.Invoke(65, "HOLD: RESTORE BASE META");
         if (!string.IsNullOrWhiteSpace(baseBackup) && Directory.Exists(baseBackup))
         {
-            RestoreMetaFromBackup(gameDir, baseBackup, log);
-            log("Smart Overlay Hold: restored base PATHC/meta from the build backup.");
+            if (RestoreMetaFromBackup(gameDir, baseBackup, log))
+                log($"Smart Overlay Hold restored exact managed base revision {holdBase.Revision}: {baseBackup}");
+            else
+                throw new InvalidOperationException("Smart Overlay Hold could not safely restore the registered managed base meta backup.");
         }
         else
         {
-            log("WARN: Smart Overlay Hold could not find the build's base meta backup. PAPGT will be rebuilt without held overlays, but PATHC may retain stale HD rows.");
+            log("WARN: Smart Overlay Hold could not find a managed base meta backup. PAPGT will be rebuilt without held overlays, but PATHC may retain stale HD rows.");
         }
 
         progress?.Invoke(76, "HOLD: UPDATE REGISTRY");
@@ -4916,7 +5848,7 @@ public sealed class OverlayService
         SafeWrite(Path.Combine(gameDir, "meta", "0.papgt"), papgt);
         log("Smart Overlay Hold: rebuilt PAPGT without held overlay folders.");
         progress?.Invoke(100, "HOLD DONE");
-        log($"Smart Overlay Hold finished. Folders moved out of the game folder: {moved}. Base meta restored: {!string.IsNullOrWhiteSpace(baseBackup) && Directory.Exists(baseBackup)}. Registry: {RegistryPath(gameDir)}");
+        log($"Smart Overlay Hold finished. Folders moved out of the game folder: {moved}. Managed base revision restored: {holdBase.Revision}. Base backup: {baseBackup.DefaultIfEmpty("<none>")}. Registry: {RegistryPath(gameDir)}");
     }
 
     public static void ReleaseHoldAndReapply(string gameDir, Action<string> log, Action<int, string>? progress = null)
@@ -4932,12 +5864,14 @@ public sealed class OverlayService
         var reserved = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var modifiedPamts = new Dictionary<string, byte[]>();
         var releasedHoldParents = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var releaseDirMaps = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
         int totalToRelease = heldMods.Sum(m => HeldOverlayList(m).Count);
         int releasedCount = 0;
         progress?.Invoke(15, totalToRelease > 0 ? $"RELEASE: RESTORE 0/{totalToRelease}" : "RELEASE: RESTORE OVERLAYS");
         foreach (var mod in heldMods)
         {
             var newDirs = new List<string>();
+            var releaseDirMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             foreach (var item in HeldOverlayList(mod))
             {
                 if (!item.TryGetValue("original_dir", out var old) || string.IsNullOrWhiteSpace(old)) continue;
@@ -4958,6 +5892,7 @@ public sealed class OverlayService
                 progress?.Invoke(Math.Min(50, releasePct), $"RELEASE: RESTORE {releasedCount}/{Math.Max(1, totalToRelease)}");
                 if (!string.IsNullOrWhiteSpace(heldParent)) releasedHoldParents.Add(heldParent);
                 newDirs.Add(targetName);
+                releaseDirMap[old] = targetName;
                 log($"Release: {heldPath} -> {target}");
                 string pamt = Path.Combine(target, "0.pamt");
                 if (File.Exists(pamt)) modifiedPamts[targetName] = File.ReadAllBytes(pamt);
@@ -4965,11 +5900,26 @@ public sealed class OverlayService
             mod["status"] = "active";
             mod["released_at"] = DateTime.Now.ToString("s");
             mod["overlay_dirs"] = newDirs;
+            if (releaseDirMap.Count > 0) releaseDirMaps[SObj(mod, "mod_id")] = releaseDirMap;
+            mod["release_dir_map"] = releaseDirMap;
             mod["held_overlays"] = new List<Dictionary<string, string>>();
         }
         progress?.Invoke(55, "RELEASE: UPDATE REGISTRY");
         reg["mods"] = mods;
         SaveRegistry(gameDir, reg);
+
+        var releaseReplaySnapshotPaths = new List<string>();
+        foreach (var mod in heldMods)
+        {
+            string snap = SObj(mod, "pathc_hold_snapshot");
+            if (!string.IsNullOrWhiteSpace(snap)) releaseReplaySnapshotPaths.Add(snap);
+            string mpForSnap = SObj(mod, "manifest_copy");
+            if (string.IsNullOrWhiteSpace(mpForSnap) || !File.Exists(mpForSnap)) mpForSnap = SObj(mod, "original_manifest");
+            var manifestInfo = !string.IsNullOrWhiteSpace(mpForSnap) && File.Exists(mpForSnap) ? ReadJsonDict(mpForSnap) : null;
+            string applySnap = manifestInfo != null ? SObj(manifestInfo, "pathc_replay_snapshot") : "";
+            if (!string.IsNullOrWhiteSpace(applySnap)) releaseReplaySnapshotPaths.Add(applySnap);
+        }
+        var releaseReplaySources = LoadPathcReplaySources(releaseReplaySnapshotPaths, log, "Release Hold + Reapply");
 
         // Reapply PATHC on top of the current meta files. This is the whole
         // point of Smart Hold: let DMM/JSON Mod Manager change meta while the
@@ -4986,10 +5936,17 @@ public sealed class OverlayService
             if (string.IsNullOrWhiteSpace(mp) || !File.Exists(mp)) { log($"WARN: released build has no readable manifest for PATHC replay: {SObj(mod, "mod_id")}"); continue; }
             var matches = ReadManifestMatches(mp);
             var entries = ReadManifestOverlayEntries(mp);
+            if (releaseDirMaps.TryGetValue(SObj(mod, "mod_id"), out var releaseDirMapForMod))
+            {
+                foreach (var e in entries)
+                {
+                    if (!string.IsNullOrWhiteSpace(e.OverlayDir) && releaseDirMapForMod.TryGetValue(e.OverlayDir, out var newOwner)) e.OverlayDir = newOwner;
+                }
+            }
             if (matches.Count == 0 || entries.Count == 0) continue;
             int replayStart = 60 + (int)Math.Round(((replayIndex - 1) / (double)Math.Max(1, heldMods.Count)) * 25.0);
             int replayEnd = 60 + (int)Math.Round((replayIndex / (double)Math.Max(1, heldMods.Count)) * 25.0);
-            var replay = UpdatePathcForMatches(gameDir, matches, entries, log, progress, replayStart, Math.Max(replayStart, replayEnd), $"RELEASE: PATHC {replayIndex}/{heldMods.Count}");
+            var replay = UpdatePathcForMatches(gameDir, matches, entries, log, progress, replayStart, Math.Max(replayStart, replayEnd), $"RELEASE: PATHC {replayIndex}/{heldMods.Count}", releaseReplaySources);
             if (replay.bytes != null) SafeWrite(Path.Combine(gameDir, "meta", "0.pathc"), replay.bytes);
         }
 

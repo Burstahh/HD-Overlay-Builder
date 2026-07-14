@@ -127,6 +127,7 @@ public sealed class MainForm : Form
     private readonly CheckBox _multiTarget = new();
     private readonly CheckBox _updateExisting = new();
     private readonly ComboBox _memoryMode = new();
+    private string _lastExternalSafeAutoKey = string.Empty;
     private readonly NumericUpDown _customWorkers = new();
     private readonly TextProgressBar _progress = new();
     private readonly System.Windows.Forms.Timer _activityTimer = new() { Interval = 120 };
@@ -143,6 +144,7 @@ public sealed class MainForm : Form
     private ComboBox _uiScaleDrop = new();
     private bool _refreshingLanguageDrop;
     private bool _refreshingMemoryMode;
+    private bool _performanceModeManuallyChangedThisSession;
     private bool _refreshingUiScaleDrop;
     private string _uiScaleCode = "Auto";
     private float _uiScaleFactor = 1.0F;
@@ -2378,7 +2380,7 @@ public sealed class MainForm : Form
     private Control CreateHeaderPerformanceModeControl()
     {
         _memoryMode.DropDownStyle = ComboBoxStyle.DropDownList;
-        _memoryMode.Width = Dpi(178);
+        _memoryMode.Width = Dpi(270);
         _memoryMode.Height = Dpi(30);
         _memoryMode.FlatStyle = FlatStyle.Flat;
         _memoryMode.BackColor = VersionButtonColor;
@@ -2394,6 +2396,7 @@ public sealed class MainForm : Form
         _memoryMode.SelectedIndexChanged += (_, _) =>
         {
             if (_refreshingMemoryMode) return;
+            _performanceModeManuallyChangedThisSession = true;
             _settings.PerformanceMemoryMode = SelectedMemoryModeCode();
             HideInlineTip();
             SaveSettings();
@@ -2426,7 +2429,7 @@ public sealed class MainForm : Form
             _memoryMode.Items.Add(new MemoryModeChoice { Code = "Auto", Text = L.T("memory_mode_auto", _lang) });
             _memoryMode.Items.Add(new MemoryModeChoice { Code = "Full", Text = L.T("memory_mode_full", _lang) });
             _memoryMode.Items.Add(new MemoryModeChoice { Code = "Medium", Text = L.T("memory_mode_medium", _lang) });
-            _memoryMode.Items.Add(new MemoryModeChoice { Code = "Low", Text = L.T("memory_mode_low", _lang) });
+            _memoryMode.Items.Add(new MemoryModeChoice { Code = "Safe", Text = L.T("memory_mode_safe", _lang) });
             SelectMemoryMode(selected);
         }
         finally { _refreshingMemoryMode = false; }
@@ -2484,7 +2487,7 @@ public sealed class MainForm : Form
         string v = (code ?? "Auto").Trim();
         if (v.Equals("Full", StringComparison.OrdinalIgnoreCase) || v.Contains("Full", StringComparison.OrdinalIgnoreCase) || v.Contains("Max", StringComparison.OrdinalIgnoreCase)) return "Full";
         if (v.Equals("Medium", StringComparison.OrdinalIgnoreCase) || v.Contains("Medium", StringComparison.OrdinalIgnoreCase) || v.Contains("Balanced", StringComparison.OrdinalIgnoreCase)) return "Medium";
-        if (v.Equals("Low", StringComparison.OrdinalIgnoreCase) || v.Contains("Low", StringComparison.OrdinalIgnoreCase) || v.Contains("Safe", StringComparison.OrdinalIgnoreCase)) return "Low";
+        if (v.Equals("Safe", StringComparison.OrdinalIgnoreCase) || v.Contains("Safe", StringComparison.OrdinalIgnoreCase) || v.Contains("External", StringComparison.OrdinalIgnoreCase) || v.Contains("Slow", StringComparison.OrdinalIgnoreCase) || v.Equals("Low", StringComparison.OrdinalIgnoreCase) || v.Contains("Low", StringComparison.OrdinalIgnoreCase)) return "Safe";
         return "Auto";
     }
 
@@ -3007,6 +3010,47 @@ public sealed class MainForm : Form
         {
             target.Text = f.SelectedPath;
             SaveSettings();
+            AutoSelectExternalDriveSafeModeIfNeeded(beforeBuild: false);
+        }
+    }
+
+    private void AutoSelectExternalDriveSafeModeIfNeeded(bool beforeBuild)
+    {
+        try
+        {
+            // Respect a manual performance choice made during this session.  Saved
+            // values from an older run may not reflect the newly selected drive, so
+            // Auto preflight is still allowed to correct those before applying.
+            if (_performanceModeManuallyChangedThisSession && !string.Equals(SelectedMemoryModeCode(), "Auto", StringComparison.OrdinalIgnoreCase)) return;
+
+            string gameDir = _game.Text.Trim();
+            string textureDir = _textures.Text.Trim();
+            if (string.IsNullOrWhiteSpace(gameDir) || string.IsNullOrWhiteSpace(textureDir)) return;
+            if (!Directory.Exists(gameDir) || !Directory.Exists(textureDir)) return;
+
+            if (!OverlayService.ShouldUseExternalDriveSafeModeForSelectedFolders(gameDir, textureDir, out string summary))
+            {
+                if (beforeBuild && !string.IsNullOrWhiteSpace(summary)) LogRuntimeOnly(summary);
+                return;
+            }
+
+            string key = (Path.GetPathRoot(gameDir) ?? gameDir).Trim().ToUpperInvariant() + "|" + (Path.GetPathRoot(textureDir) ?? textureDir).Trim().ToUpperInvariant();
+            _refreshingMemoryMode = true;
+            try { SelectMemoryMode("Safe"); }
+            finally { _refreshingMemoryMode = false; }
+            _settings.PerformanceMemoryMode = "Safe";
+            SaveSettings();
+
+            if (!string.Equals(_lastExternalSafeAutoKey, key, StringComparison.OrdinalIgnoreCase))
+            {
+                Log("Slow or external storage detected from the selected game/source folders. Performance Mode was automatically set to Slow / External Drive Safe Mode before applying.");
+                if (!string.IsNullOrWhiteSpace(summary)) LogRuntimeOnly(summary);
+                _lastExternalSafeAutoKey = key;
+            }
+        }
+        catch (Exception ex)
+        {
+            LogRuntimeOnly("External Drive Safe Mode preflight failed: " + ex.Message);
         }
     }
 
@@ -3302,6 +3346,7 @@ public sealed class MainForm : Form
         bool updateExisting = runMode == BuildRunMode.UpdateExisting;
         if (_busy) { ShowStyledMessage("dialog_notice_title", L.T("busy", _lang), L.T("dialog_notice_title", _lang), warning: true); return; }
         if (easyApply && !ConfirmEasyApply()) return;
+        AutoSelectExternalDriveSafeModeIfNeeded(beforeBuild: true);
         SaveSettings();
         BuildOptions options;
         try { options = CurrentOptions(runMode); }
@@ -3746,22 +3791,23 @@ public sealed class MainForm : Form
 
     private bool ConfirmEasyApply()
     {
-        string message = L.T("easy_apply_confirm", _lang) + Environment.NewLine + Environment.NewLine + L.T("easy_apply_usage_warning", _lang);
-        try
-        {
-            string gameDir = _game.Text.Trim();
-            if (OverlayService.HasActiveManagedOverlays(gameDir))
-            {
-                message += Environment.NewLine + Environment.NewLine + L.T("easy_apply_existing_warning", _lang);
-            }
-        }
-        catch { }
-        var size = ComputeCompactDialogSize(message, minWidth: 620, maxWidth: 900, minHeight: 390, maxHeight: 700);
-        using var dlg = CreateStyledDialog(L.T("easy_apply_confirm_title", _lang), size.Width, size.Height);
+        string gameDir = _game.Text.Trim();
+        bool existingManagedBuild;
+        try { existingManagedBuild = OverlayService.HasAnyManagedBuildState(gameDir); }
+        catch { existingManagedBuild = false; }
+
+        // Fresh first-time installs should start without an unnecessary warning.
+        // This confirmation is only for the common workflow mistake where Easy
+        // Apply is chosen over Update Existing Build on an already-managed setup.
+        if (!existingManagedBuild) return true;
+
+        string message = L.T("easy_apply_existing_build_message", _lang);
+        var size = ComputeCompactDialogSize(message, minWidth: 620, maxWidth: 900, minHeight: 320, maxHeight: 620);
+        using var dlg = CreateStyledDialog(L.T("easy_apply_existing_build_title", _lang), size.Width, size.Height);
         var outer = CreateDialogOuter(dlg, 3);
         var head = new Label
         {
-            Text = L.T("easy_apply_confirm_header", _lang),
+            Text = L.T("easy_apply_existing_build_header", _lang),
             AutoSize = true,
             Dock = DockStyle.Top,
             Font = GuiFonts.UiFont(13F, FontStyle.Bold),
@@ -3771,27 +3817,42 @@ public sealed class MainForm : Form
         outer.Controls.Add(head, 0, 0);
         outer.Controls.Add(DialogMessageBox(message, size.Width - Dpi(64)), 0, 1);
 
-        var buttons = new FlowLayoutPanel
+        // Continue stays on the left and Cancel stays on the right. Cancel is
+        // the default focused/Enter action so an accidental click does not begin
+        // a clean full rebuild.
+        var buttons = new TableLayoutPanel
         {
             Dock = DockStyle.Top,
-            FlowDirection = FlowDirection.RightToLeft,
-            WrapContents = true,
             AutoSize = true,
+            ColumnCount = 2,
+            RowCount = 1,
             BackColor = dlg.BackColor,
             Margin = new Padding(0)
         };
-        var accept = DialogButton(L.T("accept", _lang), warning: true);
-        var cancel = DialogButton(L.T("cancel", _lang));
-        accept.Width = Dpi(144);
+        buttons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+        buttons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+
+        var accept = DialogButton(L.T("continue_easy_apply", _lang), warning: true);
+        var cancel = DialogButton(L.T("cancel", _lang), primary: true);
+        accept.Width = Dpi(190);
         cancel.Width = Dpi(144);
+        accept.Anchor = AnchorStyles.Left;
+        cancel.Anchor = AnchorStyles.Right;
+        accept.DialogResult = DialogResult.OK;
+        cancel.DialogResult = DialogResult.Cancel;
         accept.Click += (_, __) => { dlg.DialogResult = DialogResult.OK; dlg.Close(); };
         cancel.Click += (_, __) => { dlg.DialogResult = DialogResult.Cancel; dlg.Close(); };
-        buttons.Controls.Add(accept);
-        buttons.Controls.Add(cancel);
+        buttons.Controls.Add(accept, 0, 0);
+        buttons.Controls.Add(cancel, 1, 0);
         outer.Controls.Add(buttons, 0, 2);
-        dlg.AcceptButton = accept;
+
+        dlg.AcceptButton = cancel;
         dlg.CancelButton = cancel;
-        return dlg.ShowDialog(this) == DialogResult.OK;
+        dlg.ActiveControl = cancel;
+        bool confirmed = dlg.ShowDialog(this) == DialogResult.OK;
+        if (confirmed)
+            Log("Easy Apply: user confirmed a clean full rebuild over an existing managed HD build. Update Existing Build was recommended in the confirmation dialog.");
+        return confirmed;
     }
 
 
@@ -3975,6 +4036,7 @@ public sealed class MainForm : Form
         {
             _game.Text = d;
             Log(string.Format(L.T("game_detected", _lang), d));
+            AutoSelectExternalDriveSafeModeIfNeeded(beforeBuild: false);
             if (!silent) ShowStyledMessage("dialog_complete_title", string.Format(L.T("game_detected", _lang), d), L.T("dialog_complete_title", _lang));
         }
         else if (!silent) ShowStyledMessage("dialog_warning_title", L.T("detect_failed", _lang), L.T("dialog_warning_title", _lang), warning: true);

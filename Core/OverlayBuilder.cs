@@ -108,6 +108,16 @@ public static class OverlayBuilder
         return PreparePayloadFromSource(sourcePath, meta, gameDir, fullPathMapCache, pathcLast4Map);
     }
 
+    private static byte[]? CaptureDdsPathcHeaderSnapshot(byte[] content)
+    {
+        if (content.Length < 128) return null;
+        if (content[0] != (byte)'D' || content[1] != (byte)'D' || content[2] != (byte)'S' || content[3] != (byte)' ') return null;
+        int len = Math.Min(148, content.Length);
+        byte[] header = new byte[len];
+        Buffer.BlockCopy(content, 0, header, 0, len);
+        return header;
+    }
+
     private static PreparedOverlayPayload PreparePayloadFromSource(
         string sourcePath,
         Dictionary<string, object?> meta,
@@ -140,6 +150,7 @@ public static class OverlayBuilder
         ushort flags;
         uint[]? mValues = null;
         uint last4 = 0;
+        byte[]? ddsPathcHeader = entryPath.EndsWith(".dds", StringComparison.OrdinalIgnoreCase) ? CaptureDdsPathcHeaderSnapshot(content) : null;
         if (compType == 1)
         {
             var (partial, m) = DdsTools.BuildPartialPayload(content);
@@ -188,6 +199,7 @@ public static class OverlayBuilder
             Flags = flags,
             DdsMValues = mValues,
             DdsLast4 = last4,
+            DdsPathcHeader = ddsPathcHeader,
             EntryPath = entryPath
         };
         return new PreparedOverlayPayload(entry, payload);
@@ -625,6 +637,8 @@ public static class OverlayBuilder
                 Flags = src.Flags,
                 DdsMValues = src.DdsMValues,
                 DdsLast4 = src.DdsLast4,
+                DdsPathcHeader = src.DdsPathcHeader,
+                OverlayDir = src.OverlayDir,
                 EntryPath = src.EntryPath
             });
 
@@ -767,7 +781,7 @@ public static class OverlayBuilder
     {
         long total = snapshot.TotalBytes;
 
-        if (mode == "low" || mode == "medium" || mode == "custom") return 1;
+        if (mode == "safe" || mode == "low" || mode == "medium" || mode == "custom") return 1;
 
         if (mode == "auto")
         {
@@ -797,7 +811,7 @@ public static class OverlayBuilder
 
     private static string InstalledPipelineReason(string mode, MemorySnapshot snapshot)
     {
-        if (mode == "low" || mode == "medium") return "";
+        if (mode == "safe" || mode == "low" || mode == "medium") return "";
         if (snapshot.TotalBytes > 0 && snapshot.TotalBytes < 30L * OneGiB)
             return " (installed RAM below multi-buffer threshold)";
         return "";
@@ -921,6 +935,13 @@ public static class OverlayBuilder
             workers = 1;
             label = ModeLabel(mode, "small part");
         }
+        else if (mode == "safe")
+        {
+            workers = customPrepareWorkers > 0 ? customPrepareWorkers : Math.Min(cpu, 2);
+            workers = Math.Clamp(workers, 1, Math.Min(cpu, 3));
+            label = $"Slow / External Drive Safe Mode ({workers} worker(s))";
+            lowCleanup = true;
+        }
         else if (mode == "low")
         {
             workers = Math.Min(cpu, 2);
@@ -935,7 +956,7 @@ public static class OverlayBuilder
         else if (mode == "medium")
         {
             workers = MediumWorkerCount(cpu);
-            label = "Medium";
+            label = "Balanced";
         }
         else if (mode == "full")
         {
@@ -1006,7 +1027,7 @@ public static class OverlayBuilder
             return Math.Clamp((int)Math.Ceiling(cpu * 0.25), 6, 8);
         }
 
-        label = "Medium";
+        label = "Balanced";
         return Math.Clamp((int)Math.Ceiling(cpu * 0.25), 2, 8);
     }
 
@@ -1049,7 +1070,7 @@ public static class OverlayBuilder
         snapshot = GetMemorySnapshot();
         if (snapshot.AvailableBytes <= 0 || snapshot.AvailableBytes >= required) return;
 
-        throw new InvalidOperationException($"Not enough available RAM to safely prepare this PAZ part. Close other apps or select Low mode. Required: {FormatBytes(required)} available; detected: {FormatBytes(snapshot.AvailableBytes)} available.");
+        throw new InvalidOperationException($"Not enough available RAM to safely prepare this PAZ part. Close other apps or select Slow / External Drive Safe Mode. Required: {FormatBytes(required)} available; detected: {FormatBytes(snapshot.AvailableBytes)} available.");
     }
 
     private static long RequiredAvailableMemory(long partLength, int workers)
@@ -1066,7 +1087,8 @@ public static class OverlayBuilder
         string v = (memoryMode ?? "").Trim().ToLowerInvariant();
         if (v.Contains("full") || v.Contains("max")) return "full";
         if (v.Contains("medium") || v.Contains("balanced")) return "medium";
-        if (v.Contains("low") || v.Contains("safe")) return "low";
+        if (v.Contains("safe") || v.Contains("external") || v.Contains("slow")) return "safe";
+        if (v.Contains("low")) return "low";
         if (v.Contains("custom")) return "custom";
         return "auto";
     }
@@ -1075,7 +1097,8 @@ public static class OverlayBuilder
         => mode switch
         {
             "full" => "Max Performance" + (string.IsNullOrWhiteSpace(detail) ? "" : " -> " + detail),
-            "medium" => "Medium" + (string.IsNullOrWhiteSpace(detail) ? "" : " -> " + detail),
+            "medium" => "Balanced" + (string.IsNullOrWhiteSpace(detail) ? "" : " -> " + detail),
+            "safe" => "Slow / External Drive Safe Mode" + (string.IsNullOrWhiteSpace(detail) ? "" : " -> " + detail),
             "low" => "Low" + (string.IsNullOrWhiteSpace(detail) ? "" : " -> " + detail),
             "custom" => "Custom" + (string.IsNullOrWhiteSpace(detail) ? "" : " -> " + detail),
             _ => "Auto / Recommended" + (string.IsNullOrWhiteSpace(detail) ? "" : " -> " + detail)

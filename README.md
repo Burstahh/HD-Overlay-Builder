@@ -5,22 +5,24 @@
 Original HD texture project by **Khain**.  
 .NET port / builder by **Burstahh**.
 
-This repository contains the public v1.4 source code with the final UI polish, safe default matching behavior, registry/state backup hardening, Manage Installed Builds manifest rebase fix, archive-folder token detection, and the mixed-DPI multi-monitor window-state hotfix.
+This repository contains the public **v1.4.2** source. It is based on the fully validated v1.4 DDS release and adds post-update metadata safety, source-independent Hold/Release replay, transactional Relink recovery, duplicate-manifest canonicalization, managed base-meta rebasing, and storage throttling for slow/external drives.
+
+See [`CHANGELOG.md`](CHANGELOG.md) for the developer-facing change history and validation details.
 
 ## What it does
 
-HD Overlay Builder helps package `.dds` texture files into Crimson Desert overlay folders while keeping the install reversible and manageable.
+HD Overlay Builder packages `.dds` texture files into Crimson Desert overlay folders while keeping the install reversible and manageable.
 
 Main workflows:
 
-- **Easy Apply**: quick/safe build using Safe Primary matching.
-- **Update Existing Build**: applies only missing or changed targets when possible.
+- **Easy Apply**: first installation or intentional clean full rebuild using Safe Primary matching.
+- **Update Existing Build**: add, replace, or update textures in a current managed build.
 - **Manual Build / Advanced**: manual filter/options workflow.
-- **Manage Installed Builds**: view/remove selected managed installs.
-- **Smart Overlay Hold**: temporarily move managed overlays out of the game folder.
-- **Release Hold + Reapply**: restore held overlays and replay PATHC state.
-- **Relink Overlays After Game Update**: relink existing overlays against updated game metadata.
-- **Remove Current Build**: restore base metadata and remove managed overlays.
+- **Manage Installed Builds**: view or remove selected managed builds.
+- **Smart Overlay Hold**: temporarily move managed overlays out of the game folder and restore the active managed base.
+- **Release Hold + Reapply**: restore held overlays and replay their managed PATHC state.
+- **Relink Overlays After Game Update**: relink installed overlays against the current game/mod-manager metadata.
+- **Remove Current Build**: restore the active managed base and remove the current managed overlays.
 
 Overlay folders intentionally remain named:
 
@@ -30,26 +32,88 @@ HD01, HD02, HD03, ...
 
 ## Current release status
 
-**Version:** v1.4
+**Version:** v1.4.2  
+**Validated game basis:** Crimson Desert v1.13.00
 
-Final validation passed against the public v1.4 build, including:
+The public DDS workflow has been validated with:
 
-- Fresh Easy Apply with 28,069 DDS files.
-- Same-folder Update Existing skip path.
-- Small-folder update creating HD07 and hotfixing one existing HD01 target.
-- Manage Installed Builds / Remove Selected Build manifest rebase.
-- Smart Overlay Hold / Release Hold + Reapply.
-- Relink.
-- In-game boot/world test with HD01-HD07 active.
-- Final Remove Current Build cleanup.
-- Mixed-DPI/multi-monitor window-state hotfix testing.
+- Fresh Easy Apply using 28,069 DDS files.
+- Unchanged and incremental Update Existing Build paths.
+- Small-folder updates, HD07 creation, and an existing-overlay hotfix.
+- Manage Installed Builds removal/rebase behavior.
+- Smart Overlay Hold and source-independent Release Hold + Reapply.
+- Relink against freshly verified stock metadata with the original DDS source folders unavailable.
+- Duplicate historical manifest canonicalization with every unique managed target resolved before commit.
+- Successful in-game boot/world tests with correct textures and no rainbow/corrupted textures.
+- Remove Current Build and stale-base restoration safety.
+- Mixed-DPI and multi-monitor window-state handling.
+
+## v1.4.2 highlights
+
+### Slow / External Drive Safe Mode
+
+Performance Mode includes **Slow / External Drive Safe Mode** for USB drives, external HDDs, network storage, or other slow locations.
+
+Safe Mode reduces simultaneous disk pressure by favoring a single-buffer PAZ pipeline, fewer prep workers, and less aggressive read-ahead. **Auto / Recommended** remains the normal default and uses conservative storage detection so internal SSD/NVMe systems are not unnecessarily throttled.
+
+### Source-independent Hold and Relink
+
+After Easy Apply or Update Existing Build has created managed `HD##` overlays, the original extracted DDS source folder is not required for:
+
+- Smart Overlay Hold
+- Release Hold + Reapply
+- Relink Overlays After Game Update
+
+The source folder is still required when adding, replacing, or rebuilding texture payloads with Easy Apply or Update Existing Build.
+
+### Safer Relink transactions
+
+Relink validates and canonicalizes every unique managed target before committing current PATHC/PAPGT changes. Historical duplicate manifest ownership is collapsed, the newest applicable record is preferred, and unresolved targets abort the operation instead of leaving a partial managed install.
+
+A failed Relink restores the pre-Relink metadata and preserves the active managed build, manifests, registry/state, and installed `HD##` folders.
+
+### Managed base-meta rebasing
+
+After a successful Relink, the current **pre-overlay underlay** becomes the new active managed base. This may be freshly verified stock metadata or valid mod-manager-adjusted metadata.
+
+Future Smart Hold and Remove Current Build operations restore that rebased current base instead of the original metadata from an older game patch.
+
+### Easy Apply workflow warning
+
+When an active managed build already exists, Easy Apply now warns that it performs a clean full rebuild and directs incremental users to **Update Existing Build**.
+
+## Recommended workflows
+
+### First installation
+
+1. Apply regular non-texture mods through DMM or another mod manager.
+2. Select the Crimson Desert game folder.
+3. Select the DDS texture source folder.
+4. Use **Easy Apply**.
+
+### Adding or replacing textures
+
+Use **Update Existing Build**. Do not use Easy Apply unless a complete clean rebuild is intended.
+
+### Game update with a modded setup
+
+When possible, the safest heavily modded workflow is:
+
+1. Smart Overlay Hold.
+2. Update, sort, or remount regular mod-manager content.
+3. Release Hold + Reapply.
+
+### Game already updated
+
+Use **Relink Overlays After Game Update** when the game updated before the overlays could be held and the rest of the installed mod state is known to be correct.
+
+Texture-only users can generally use Relink as the straightforward post-update recovery option.
 
 ## Requirements
 
 - Windows 10/11 x64.
-- .NET SDK capable of building `net8.0-windows` WinForms projects.
-  - The build scripts were tested with modern .NET SDK installs.
-- PowerShell, used by the helper build scripts for ZIP/font preparation.
+- A .NET SDK capable of building `net8.0-windows` WinForms projects.
+- PowerShell for ZIP and optional font preparation helpers.
 
 ## Quick build
 
@@ -62,10 +126,11 @@ BUILD_WINDOWS.bat
 Output:
 
 ```text
-publish\win-x64\HD Overlay Builder.exe
+publish\HD Overlay Builder\HD Overlay Builder.exe
+publish\HD Overlay Builder\README.md
 ```
 
-The build is self-contained and single-file by default.
+The normal published end-user folder does not retain a separate `Resources` folder.
 
 ## Release build/package
 
@@ -97,16 +162,15 @@ av_variants\
 
 ## Optional embedded Noto Sans fonts
 
-The app can run without embedded Noto Sans font files. If the embedded font files are absent, it falls back to installed Noto Sans or Segoe UI.
+The repository includes `Noto_Sans.zip`. The build scripts call the font preparation helper automatically before publishing.
 
-For a local embedded-font build, place `Noto_Sans.zip` beside `PREPARE_NOTO_SANS_WINDOWS.bat`, then run:
+To prepare the fonts manually:
 
 ```bat
 PREPARE_NOTO_SANS_WINDOWS.bat
-BUILD_WINDOWS.bat
 ```
 
-Expected prepared files:
+Prepared local files:
 
 ```text
 Resources\Fonts\NotoSans-Regular.ttf
@@ -116,24 +180,24 @@ Resources\Fonts\NotoSans-BoldItalic.ttf
 Resources\Fonts\OFL_NOTO_SANS.txt
 ```
 
+Generated `.ttf` files are build-time resources and are intentionally excluded from the clean repository/source ZIP layout.
+
 Noto Sans is distributed by Google under the SIL Open Font License. Keep the OFL license text with any font files you redistribute.
 
 ## Window reset options
 
-If the app ever opens offscreen because of monitor/DPI changes, use one of these reset methods:
+If the app opens offscreen after monitor/DPI changes, use either reset argument:
 
 ```bat
 HD Overlay Builder.exe --reset-window
 HD Overlay Builder.exe --reset-window-state
 ```
 
-You can also hold **Shift** while launching the app to reset saved window placement.
-
-v1.4 includes additional startup validation and mixed-DPI multi-monitor maximize/restore handling so the window should stay on the monitor where it is currently located.
+You can also hold **Shift** while launching to reset saved window placement.
 
 ## Archive-folder source detection
 
-The builder supports known archive IDs in top-level DDS source folder names.
+Top-level DDS source folder names can scope known archive IDs.
 
 Supported archive tokens:
 
@@ -150,30 +214,33 @@ CDHDTR0001    -> archive scope 0001
 SomePack0015  -> archive scope 0015
 ```
 
-This detection is whitelist-based and avoids broad random 4-digit matching.
+Detection is whitelist-based and does not broadly match arbitrary four-digit text.
 
 ## Managed data folder
 
-New v1.4 managed state uses:
+Current managed state uses:
 
 ```text
 HDOverlayBuilder
 ```
 
-Legacy folders such as `HDUpscaleOverlayBuilder` are still detected/handled for compatibility. The app should not strand older managed builds.
+Legacy folders such as `HDUpscaleOverlayBuilder` remain supported for compatibility so older managed builds are not stranded.
 
 ## Safety notes
 
 - Safe Primary matching remains the default for Easy Apply and Update Existing Build.
-- Legacy duplicate fan-out is advanced/manual opt-in only.
-- Build/update/relink/remove behavior is designed to be reversible through the managed backup/restore flow.
-- Remove Current Build restores base metadata and removes managed `HD##` overlays for the current build.
+- Legacy duplicate fan-out remains advanced/manual opt-in only.
+- Overlay folder naming remains `HD01`, `HD02`, `HD03`, etc.
+- Relink only commits after all unique managed targets resolve.
+- Hold/Release and Relink can replay existing managed overlays without the original DDS source folder.
+- Successful Relink rebases the active managed underlay for later Hold/Remove operations.
+- Backup, rollback, manifest, registry/state, PAMT, PAPGT, PATHC, and PAZ safety behavior should be preserved when developing forks.
 
 ## Repository layout
 
 ```text
 Core/                         Core overlay/build/update/relink logic
-Resources/                    App icon/preview/font placeholder resources
+Resources/                    App icon, preview, and font license placeholders
 AppSetting.cs                 App setting model
 Localization.cs               UI/log localization strings
 MainForm.cs                   WinForms UI and window-state handling
@@ -182,22 +249,27 @@ HDOverlayBuilder.csproj       .NET project file
 BUILD_WINDOWS.bat             Quick local build
 BUILD_RELEASE_WINDOWS.bat     Release/package build
 BUILD_AV_VARIANTS_WINDOWS.bat Alternate package variants
-PREPARE_NOTO_SANS_WINDOWS.bat Optional embedded Noto Sans prep
+PREPARE_NOTO_SANS_WINDOWS.bat Embedded Noto Sans preparation
+Noto_Sans.zip                 Source font archive used by the prep script
+CHANGELOG.md                  Developer/forker change history and validation notes
 ```
 
 ## Development notes
 
-Please keep these areas stable unless intentionally working on a specific fix:
+The following behavior is considered stable and should not be changed unintentionally:
 
-- Safe Primary matching behavior.
-- Easy Apply / Update Existing Build behavior.
-- Overlay folder naming (`HD01`, `HD02`, `HD03`, etc.).
+- Safe Primary matching and archive routing.
+- Easy Apply and Update Existing Build semantics.
+- Overlay naming and split behavior.
 - PAZ/PAMT/PAPGT/PATHC handling.
-- Manifest/schema behavior.
-- Relink behavior.
-- Remove Current Build behavior.
-- Smart Overlay Hold / Release Hold + Reapply behavior.
-- Backup/restore safety.
+- Manifest trust/fallback and partial-source overwrite protection.
+- FIX05 source-independent Hold/Release replay.
+- FIX06 Relink canonicalization and full-resolution-before-commit behavior.
+- FIX07 managed base-meta rebasing and rollback behavior.
+- Manage Installed Builds and Remove Current Build behavior.
+- Window layout, DPI scaling, and window-state handling.
+
+See [`CHANGELOG.md`](CHANGELOG.md) before modifying these areas.
 
 ## License
 
